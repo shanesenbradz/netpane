@@ -2,15 +2,18 @@
 """
 NetPane: a single pane of glass for Linux network troubleshooting.
 
-Run it:      sudo python3 netpane.py
+Linux:       sudo python3 netpane.py
+Windows:     NetPane.exe   (or: python netpane.py, after pip install psutil)
 Then open:   http://127.0.0.1:8765   (opens automatically)
 
-Root is optional but unlocks arping, tcpdump, nethogs, iftop and process names
-on every socket. Only the Python 3 standard library is required. Every external
-tool (ip, ss, fping, nmap, mtr, dig, ...) is used when present and skipped when not.
+On Linux only the standard library is needed; root unlocks arping, tcpdump,
+nethogs and process names on every socket. On Windows it uses psutil plus the
+built-in tools (ping, tracert, netsh, PowerShell). Every external tool is used
+when present and skipped when not.
 """
 
 import argparse
+import base64
 import collections
 import concurrent.futures as cf
 import datetime as dt
@@ -18,11 +21,16 @@ import importlib.util
 import ipaddress
 import json
 import os
+import platform as pyplatform
+import random
 import re
 import shlex
 import shutil
 import socket
+import statistics
+import struct
 import subprocess
+import sys
 import textwrap
 import threading
 import time
@@ -32,8 +40,27 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "1.1.0"
-IS_ROOT = hasattr(os, "geteuid") and os.geteuid() == 0
+try:
+    import psutil
+except ImportError:  # optional on Linux, bundled in the Windows exe
+    psutil = None
+
+VERSION = "1.2.0"
+IS_WIN = os.name == "nt"
+PLATFORM = "windows" if IS_WIN else "linux"
+
+
+def _is_admin():
+    if IS_WIN:
+        try:
+            import ctypes
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:  # noqa: BLE001
+            return False
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+IS_ROOT = _is_admin()
 ENV = dict(os.environ, LC_ALL="C", LANG="C")
 STATE = {}
 STATE_LOCK = threading.Lock()
@@ -55,18 +82,38 @@ def remember(key, value):
     return value
 
 
+WIN_TOOL_DIRS = [os.path.join(os.environ.get(v, ""), d) for v, d in
+                 (("ProgramFiles", "Wireshark"), ("ProgramFiles", "Nmap"), ("ProgramFiles(x86)", "Nmap"),
+                  ("ProgramFiles", "iperf3"), ("ProgramFiles", "Sysinternals"))]
+
+
+def which(binary):
+    found = shutil.which(binary)
+    if found or not IS_WIN:
+        return found
+    for d in WIN_TOOL_DIRS:
+        for ext in (".exe", ""):
+            cand = os.path.join(d, binary + ext)
+            if os.path.isfile(cand):
+                return cand
+    return None
+
+
 def have(binary):
-    return shutil.which(binary) is not None
+    return which(binary) is not None
 
 
-def run(cmd, timeout=15):
+def run(cmd, timeout=15, encoding=None):
     if isinstance(cmd, str):
         cmd = shlex.split(cmd)
-    if not cmd or not have(cmd[0]):
+    path = which(cmd[0]) if cmd else None
+    if not path:
         return {"ok": False, "rc": 127, "out": "", "err": f"{cmd[0] if cmd else '?'} is not installed"}
+    extra = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if IS_WIN else {}
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                           env=ENV, stdin=subprocess.DEVNULL)
+        p = subprocess.run([path] + list(cmd[1:]), capture_output=True, text=True, timeout=timeout,
+                           env=ENV, stdin=subprocess.DEVNULL, errors="replace",
+                           encoding=encoding or ("oem" if IS_WIN else "utf-8"), **extra)
         return {"ok": p.returncode == 0, "rc": p.returncode, "out": p.stdout, "err": p.stderr}
     except subprocess.TimeoutExpired as e:
         out = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
@@ -94,7 +141,7 @@ def read(path, default=None):
 # --------------------------------------------------------------------------
 # tool inventory (the 30 tools plus a couple of name helpers)
 # --------------------------------------------------------------------------
-TOOLS = [
+TOOLS_LINUX = [
     ("ping", "iputils-ping", "Connectivity", "Reachability and round-trip time"),
     ("traceroute", "traceroute", "Connectivity", "Hop-by-hop path"),
     ("tracepath", "iputils-tracepath", "Connectivity", "Path and MTU discovery, no root needed"),
@@ -129,19 +176,75 @@ TOOLS = [
     ("nload", "nload", "Bandwidth", "Bandwidth per interface"),
     ("nethogs", "nethogs", "Bandwidth", "Bandwidth per process"),
     ("vnstat", "vnstat", "Bandwidth", "Traffic history"),
-    ("avahi-resolve-address", "avahi-utils", "Names", "mDNS names for neighbours"),
-    ("nmblookup", "samba-common-bin", "Names", "NetBIOS names for Windows neighbours"),
 ]
+PRESETS_LINUX = {
+    "ping": ["-c 4 {gw}", "-c 4 1.1.1.1", "-c 4 google.com"], "traceroute": ["-n 1.1.1.1"], "tracepath": ["-n 1.1.1.1"],
+    "mtr": ["-n 1.1.1.1", "-n google.com"], "hping3": ["-S -p 443 -c 3 1.1.1.1"],
+    "fping": ["-a -g {net}", "-c 3 {gw} 1.1.1.1 8.8.8.8"], "ip": ["addr", "route", "neigh", "-s link", "rule"],
+    "ifconfig": ["-a"], "ethtool": ["{dev}", "-i {dev}", "-S {dev}"], "iw": ["dev", "dev {dev} link"], "iwconfig": [""],
+    "nmcli": ["device", "connection show", "device wifi list", "general"], "lspci": ["-nn"],
+    "lshw": ["-class network -short"], "route": ["-n"], "arp": ["-n"], "arping": ["-c 3 -I {dev} {gw}"],
+    "ss": ["-tulpn", "-tunap", "-s"], "netstat": ["-tulpn", "-i", "-rn"], "lsof": ["-i -P -n"],
+    "nc": ["-zv -w 3 {gw} 80", "-zv -w 3 google.com 443"],
+    "dig": ["google.com", "+trace google.com", "-x 8.8.8.8", "MX gmail.com"], "nslookup": ["google.com"],
+    "host": ["google.com"], "whois": ["8.8.8.8", "google.com"],
+    "tcpdump": ["-i {dev} -c 30", "-i {dev} -c 30 port 53", "-i {dev} -c 20 arp", "-i {dev} -c 30 icmp"],
+    "tshark": ["-i {dev} -c 30"], "ngrep": ["-d {dev} -q -n 20 GET"], "nmap": ["-sn {net}", "-F {gw}", "-sV -F {gw}"],
+    "iperf3": ["-c <server> -t 5", "-c <server> -R -t 5", "-s"], "iftop": ["-i {dev}"], "nethogs": ["{dev}"],
+    "nload": [""], "vnstat": ["", "-d", "-h", "-m"],
+}
+TOOLS_WIN = [
+    ("ping", "built in", "Connectivity", "Reachability and round-trip time"),
+    ("tracert", "built in", "Connectivity", "Hop-by-hop path"),
+    ("pathping", "built in", "Connectivity", "Trace plus per-hop loss statistics"),
+    ("curl", "built in", "Connectivity", "HTTP and HTTPS requests"),
+    ("ipconfig", "built in", "Interfaces", "Addresses, DHCP and DNS settings"),
+    ("getmac", "built in", "Interfaces", "Hardware addresses"),
+    ("netsh", "built in", "Interfaces", "Wi-Fi, interfaces and firewall settings"),
+    ("hostname", "built in", "Interfaces", "This computer's name"),
+    ("route", "built in", "Routing & ARP", "Routing table"),
+    ("arp", "built in", "Routing & ARP", "ARP table (IP to MAC)"),
+    ("netstat", "built in", "Sockets", "Connections, ports and interface stats"),
+    ("nslookup", "built in", "DNS", "DNS lookups"),
+    ("nbtstat", "built in", "DNS", "NetBIOS names"),
+    ("whois", "Sysinternals", "DNS", "Domain and IP registration"),
+    ("tshark", "Wireshark", "Capture", "Wireshark on the command line"),
+    ("nmap", "Nmap", "Scanning", "Hosts, ports and services"),
+    ("iperf3", "iperf3", "Bandwidth", "Throughput between two hosts"),
+]
+PRESETS_WIN = {
+    "ping": ["-n 4 {gw}", "-n 4 1.1.1.1", "-n 4 google.com", "-f -l 1472 -n 2 1.1.1.1"],
+    "tracert": ["-d 1.1.1.1", "-d google.com"], "pathping": ["-n 1.1.1.1"],
+    "curl": ["-sI https://www.google.com", "-s https://api.ipify.org"], "ipconfig": ["/all", "/displaydns"],
+    "getmac": ["/v"], "hostname": [""],
+    "netsh": ["wlan show interfaces", "wlan show networks mode=bssid", "interface ipv4 show subinterfaces",
+              "advfirewall show allprofiles state"],
+    "route": ["print -4"], "arp": ["-a"], "netstat": ["-ano", "-e", "-rn", "-s"],
+    "nslookup": ["google.com", "google.com 1.1.1.1", "-type=MX gmail.com"], "nbtstat": ["-A {gw}", "-n"],
+    "whois": ["8.8.8.8"], "tshark": ["-D", "-i 1 -c 30"], "nmap": ["-sn {net}", "-F {gw}", "-sV -F {gw}"],
+    "iperf3": ["-c <server> -t 5", "-c <server> -R -t 5", "-s"],
+}
+WINGET = {"nmap": "Insecure.Nmap", "tshark": "WiresharkFoundation.Wireshark"}
+TOOLS = TOOLS_WIN if IS_WIN else TOOLS_LINUX
+PRESETS = PRESETS_WIN if IS_WIN else PRESETS_LINUX
 
 
 def tool_inventory():
-    tools = [{"cmd": c, "package": p, "category": cat, "desc": d,
-              "installed": have(c), "path": shutil.which(c) or ""} for c, p, cat, d in TOOLS]
+    tools = [{"cmd": c, "package": p, "category": cat, "desc": d, "installed": have(c), "path": which(c) or "",
+              "presets": PRESETS.get(c, [])} for c, p, cat, d in TOOLS]
     libs = [{"name": n, "installed": importlib.util.find_spec(m) is not None}
             for n, m in (("scapy", "scapy"), ("psutil", "psutil"))]
-    missing = sorted({t["package"] for t in tools if not t["installed"]})
+    missing = [t for t in tools if not t["installed"]]
+    if IS_WIN:
+        cmds = [f"winget install -e --id {WINGET[t['cmd']]}" for t in missing if t["cmd"] in WINGET]
+        install = "; ".join(cmds)
+        hint = "Add the optional extras from PowerShell (the Nmap installer also adds Npcap):"
+    else:
+        pkgs = sorted({t["package"] for t in missing})
+        install = ("sudo apt install -y " + " ".join(pkgs)) if pkgs else ""
+        hint = "Install the missing ones on Debian or Ubuntu:"
     return {"tools": tools, "libs": libs, "installed": sum(t["installed"] for t in tools),
-            "install_cmd": ("sudo apt install -y " + " ".join(missing)) if missing else ""}
+            "install_cmd": install, "install_hint": hint, "platform": PLATFORM}
 
 
 # --------------------------------------------------------------------------
@@ -190,6 +293,437 @@ def vendor(mac):
     return oui_db().get(h[:6], "")
 
 
+
+# --------------------------------------------------------------------------
+# pure-Python DNS, mDNS and NetBIOS lookups (same on Linux and Windows)
+# --------------------------------------------------------------------------
+def _dns_name(msg, off, depth=0):
+    labels, jumped, end = [], False, off
+    while True:
+        if off >= len(msg):
+            raise ValueError("truncated")
+        ln = msg[off]
+        if ln == 0:
+            off += 1
+            break
+        if ln & 0xC0 == 0xC0:
+            depth += 1
+            if depth > 20:
+                raise ValueError("pointer loop")
+            if not jumped:
+                end = off + 2
+            jumped = True
+            off = ((ln & 0x3F) << 8) | msg[off + 1]
+            continue
+        labels.append(msg[off + 1:off + 1 + ln].decode("utf-8", "replace"))
+        off += 1 + ln
+    return ".".join(labels), (end if jumped else off)
+
+
+def _qname(name):
+    out = b""
+    for part in name.rstrip(".").split("."):
+        if part:
+            p = part.encode("ascii", "ignore")[:63]
+            out += bytes([len(p)]) + p
+    return out + b"\x00"
+
+
+DNS_RCODES = {1: "malformed query (FORMERR)", 2: "server failure (SERVFAIL)",
+              3: "name does not exist (NXDOMAIN)", 4: "not implemented", 5: "refused"}
+
+
+def dns_query(server, name, qtype=1, port=53, timeout=2.0, raw_name=None):
+    """Send one UDP DNS-style query and parse the answers. Used for DNS (53), mDNS (5353) and NetBIOS (137)."""
+    tid = random.randint(0, 0xFFFF)
+    flags = 0x0100 if port == 53 else 0
+    pkt = struct.pack(">HHHHHH", tid, flags, 1, 0, 0, 0) + (raw_name or _qname(name)) + struct.pack(">HH", qtype, 1)
+    host = server.split("%")[0]
+    t0 = time.time()
+    ms = lambda: round((time.time() - t0) * 1000)  # noqa: E731
+    try:
+        s = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_DGRAM)
+    except OSError as e:
+        return {"ok": False, "err": str(e), "ms": 0, "answers": []}
+    try:
+        s.sendto(pkt, (host, port))
+        while True:
+            left = timeout - (time.time() - t0)
+            if left <= 0:
+                raise socket.timeout()
+            s.settimeout(left)
+            data, _ = s.recvfrom(4096)
+            if len(data) >= 12 and struct.unpack(">H", data[:2])[0] == tid:
+                break
+    except socket.timeout:
+        return {"ok": False, "err": "timed out", "ms": ms(), "answers": []}
+    except OSError as e:
+        return {"ok": False, "err": str(e), "ms": ms(), "answers": []}
+    finally:
+        s.close()
+    took = ms()
+    try:
+        rflags, qd, an = struct.unpack(">HHH", data[2:8])
+        off = 12
+        for _ in range(qd):
+            _, off = _dns_name(data, off)
+            off += 4
+        answers = []
+        for _ in range(an):
+            _, off = _dns_name(data, off)
+            rtype, _, _, rdlen = struct.unpack(">HHIH", data[off:off + 10])
+            off += 10
+            rdata = data[off:off + rdlen]
+            if rtype == 1 and rdlen == 4:
+                answers.append(socket.inet_ntoa(rdata))
+            elif rtype == 12:
+                answers.append(_dns_name(data, off)[0])
+            elif rtype == 33 and qtype == 33:  # NetBIOS node status
+                answers.append(rdata)
+            off += rdlen
+    except (ValueError, struct.error, IndexError):
+        return {"ok": False, "err": "malformed reply", "ms": took, "answers": []}
+    rcode = rflags & 0xF
+    ok = rcode == 0 and bool(answers)
+    err = "" if ok else (DNS_RCODES.get(rcode, f"error code {rcode}") if rcode else "no answer")
+    return {"ok": ok, "rcode": rcode, "err": err, "answers": answers, "ms": took}
+
+
+def mdns_name(ip):
+    rev = ".".join(reversed(ip.split("."))) + ".in-addr.arpa"
+    r = dns_query(ip, rev, 12, port=5353, timeout=1.0)
+    for a in r["answers"]:
+        if isinstance(a, str) and a:
+            return a.rstrip(".")
+    return ""
+
+
+def nbns_name(ip):
+    enc = "".join(chr(65 + (b >> 4)) + chr(65 + (b & 15)) for b in b"*" + b"\x00" * 15).encode()
+    r = dns_query(ip, "", 0x21, port=137, timeout=1.0, raw_name=bytes([32]) + enc + b"\x00")
+    for rd in r["answers"]:
+        if not isinstance(rd, bytes) or not rd:
+            continue
+        for i in range(rd[0]):
+            e = rd[1 + i * 18:1 + (i + 1) * 18]
+            if len(e) < 18:
+                break
+            nm = e[:15].decode("ascii", "replace").strip()
+            if e[15] == 0 and not struct.unpack(">H", e[16:18])[0] & 0x8000 and nm:
+                return nm
+    return ""
+
+
+# --------------------------------------------------------------------------
+# Windows platform layer (psutil + PowerShell + built-in tools)
+# --------------------------------------------------------------------------
+def W(linux_text, windows_text):
+    return windows_text if IS_WIN else linux_text
+
+
+def as_list(x):
+    if x is None:
+        return []
+    return x if isinstance(x, list) else [x]
+
+
+def powershell(script, timeout=30):
+    full = "$ErrorActionPreference='SilentlyContinue';[Console]::OutputEncoding=[Text.Encoding]::UTF8;" + script
+    enc = base64.b64encode(full.encode("utf-16-le")).decode()
+    r = run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", enc],
+            timeout, encoding="utf-8")
+    try:
+        return json.loads(r["out"]) if r["out"].strip() else None
+    except ValueError:
+        return None
+
+
+PS_SNAPSHOT = (
+    "$o=[ordered]@{};"
+    "$o.adapters=@(Get-NetAdapter | Select-Object Name,InterfaceDescription,MacAddress,LinkSpeed,HardwareInterface,"
+    "@{n='Status';e={[string]$_.Status}},@{n='Media';e={[string]$_.PhysicalMediaType}});"
+    "$o.routes=@(Get-NetRoute -AddressFamily IPv4 | Select-Object DestinationPrefix,NextHop,InterfaceAlias,RouteMetric,InterfaceMetric);"
+    "$o.dns=@(Get-DnsClientServerAddress -AddressFamily IPv4 | Where-Object {$_.ServerAddresses} | Select-Object InterfaceAlias,ServerAddresses);"
+    "$o.suffix=@((Get-DnsClientGlobalSetting).SuffixSearchList);"
+    "$o | ConvertTo-Json -Depth 4 -Compress"
+)
+PS_NEIGH = ("@(Get-NetNeighbor -AddressFamily IPv4 | Select-Object IPAddress,LinkLayerAddress,InterfaceAlias,"
+            "@{n='State';e={[string]$_.State}}) | ConvertTo-Json -Compress")
+_SNAP = {"t": 0, "d": None}
+_SNAP_LOCK = threading.Lock()
+
+
+def win_snapshot(force=False):
+    with _SNAP_LOCK:
+        if not force and _SNAP["d"] and time.time() - _SNAP["t"] < 5:
+            return _SNAP["d"]
+        raw = powershell(PS_SNAPSHOT) or {}
+        d = {k: as_list(raw.get(k)) for k in ("adapters", "routes", "dns", "suffix")}
+        _SNAP.update(t=time.time(), d=d)
+        return d
+
+
+def neigh_table(dev=None, ip=None):
+    """Neighbour (ARP) table in the same shape as `ip -j neigh` output."""
+    if not IS_WIN:
+        return run_json(["ip", "-j", "neigh", "show"] + (["dev", dev] if dev else []) + ([ip] if ip else [])) or []
+    rows = as_list(powershell(PS_NEIGH))
+    if not rows:  # fall back to arp -a
+        for line in run(["arp", "-a"], 10)["out"].splitlines():
+            m = re.match(r"\s*(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F-]{17})\s+(\S+)", line)
+            if m:
+                rows.append({"IPAddress": m.group(1), "LinkLayerAddress": m.group(2), "State": "Reachable"})
+    out = []
+    for r in rows:
+        ipa = str(r.get("IPAddress") or "")
+        if ":" in ipa or not ipa or (dev and r.get("InterfaceAlias") not in (None, dev)) or (ip and ipa != ip):
+            continue
+        try:
+            a = ipaddress.ip_address(ipa)
+            if a.is_multicast or ipa.endswith(".255"):
+                continue
+        except ValueError:
+            continue
+        mac = str(r.get("LinkLayerAddress") or "").replace("-", ":").lower()
+        if mac in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"):
+            mac = ""
+        st = str(r.get("State") or "").upper()
+        out.append({"dst": ipa, "lladdr": mac, "state": ["FAILED" if st == "UNREACHABLE" else st]})
+    return out
+
+
+def _netsh_blocks(text):
+    blocks, cur = [], {}
+    for line in text.splitlines():
+        if ":" not in line:
+            if cur:
+                blocks.append(cur)
+                cur = {}
+            continue
+        k, _, v = line.partition(":")
+        k = k.strip().lower()
+        if k == "name" and "name" in cur:
+            blocks.append(cur)
+            cur = {}
+        cur[k] = v.strip()
+    if cur:
+        blocks.append(cur)
+    return blocks
+
+
+def wifi_links_win():
+    out = {}
+    for b in _netsh_blocks(run(["netsh", "wlan", "show", "interfaces"], 10)["out"]):
+        if "name" not in b:
+            continue
+        info = {"ssid": b.get("ssid", ""), "bssid": b.get("ap bssid") or b.get("bssid", "")}
+        m = re.match(r"(\d+)", b.get("signal", ""))
+        if m:
+            pct = int(m.group(1))
+            info.update(signal_pct=pct, signal=round(pct / 2 - 100))
+        if b.get("band"):
+            info["freq"] = b["band"]
+        if b.get("channel"):
+            info["channel"] = b["channel"]
+        rate = b.get("receive rate (mbps)") or b.get("transmit rate (mbps)")
+        if rate:
+            info["bitrate"] = f"{rate} Mbit/s"
+        info["connected"] = bool(info["ssid"])
+        out[b["name"]] = info
+    return out
+
+
+def interfaces_win():
+    if psutil is None:
+        return []
+    ad = {a.get("Name"): a for a in win_snapshot()["adapters"]}
+    addrs, stats, io = psutil.net_if_addrs(), psutil.net_if_stats(), psutil.net_io_counters(pernic=True)
+    wl = None
+    out = []
+    for name, al in addrs.items():
+        a, st, c = ad.get(name, {}), stats.get(name), io.get(name)
+        mac, v4, v6 = "", [], []
+        for x in al:
+            if x.family == psutil.AF_LINK:
+                mac = x.address.replace("-", ":").lower()
+            elif x.family == socket.AF_INET:
+                try:
+                    pl = ipaddress.ip_network(f"0.0.0.0/{x.netmask}").prefixlen if x.netmask else 32
+                except ValueError:
+                    pl = 24
+                v4.append(f"{x.address}/{pl}")
+            elif x.family == socket.AF_INET6:
+                v6.append(x.address.split("%")[0])
+        lo = name.lower().startswith("loopback") or any(v.startswith("127.") for v in v4)
+        up = bool(st and st.isup)
+        desc = str(a.get("InterfaceDescription") or "")
+        wireless = "802.11" in str(a.get("Media") or "") or bool(re.search(r"wi-?fi|wireless|wlan|802\.11", desc + " " + name, re.I))
+        duplex = {psutil.NIC_DUPLEX_FULL: "full", psutil.NIC_DUPLEX_HALF: "half"}.get(getattr(st, "duplex", None))
+        item = {
+            "name": name, "state": "UP" if up else "DOWN", "mac": mac, "mtu": st.mtu if st else None,
+            "flags": ["LOOPBACK"] if lo else [], "carrier": None if lo else ("1" if up else "0"),
+            "speed": (st.speed or None) if st else None, "duplex": duplex, "driver": desc or None,
+            "wireless": wireless, "virtual": a.get("HardwareInterface") is False or (not a and not lo),
+            "loopback": lo, "ipv4": v4, "ipv6": v6,
+            "rx_bytes": c.bytes_recv if c else None, "tx_bytes": c.bytes_sent if c else None,
+            "rx_errors": c.errin if c else 0, "tx_errors": c.errout if c else 0,
+            "rx_dropped": c.dropin if c else 0, "tx_dropped": c.dropout if c else 0,
+        }
+        item["vendor"] = "" if lo else vendor(mac)
+        if wireless:
+            if wl is None:
+                wl = wifi_links_win()
+            item["wifi"] = wl.get(name, {"connected": False})
+        out.append(item)
+    return out
+
+
+def routes_win():
+    r4, gws = [], []
+    for r in win_snapshot()["routes"]:
+        dst, nh = str(r.get("DestinationPrefix") or ""), str(r.get("NextHop") or "0.0.0.0")
+        try:
+            net = ipaddress.ip_network(dst, strict=False)
+        except ValueError:
+            continue
+        if net.is_multicast or net.is_loopback or net.prefixlen == 32:
+            continue
+        metric = int(r.get("RouteMetric") or 0) + int(r.get("InterfaceMetric") or 0)
+        row = {"dst": "default" if dst == "0.0.0.0/0" else dst, "dev": r.get("InterfaceAlias"), "metric": metric}
+        if nh != "0.0.0.0":
+            row["gateway"] = nh
+        r4.append(row)
+        if row["dst"] == "default" and row.get("gateway"):
+            gws.append({"gateway": nh, "dev": row["dev"], "metric": metric, "proto": ""})
+    gws.sort(key=lambda g: g["metric"])
+    r4.sort(key=lambda x: (x["dst"] != "default", x["metric"]))
+    return {"ipv4": r4, "ipv6": [], "gateways": gws}
+
+
+def dns_info_win():
+    snap = win_snapshot()
+    gws = routes_win()["gateways"]
+    pdev = gws[0]["dev"] if gws else None
+    rows = snap["dns"]
+    mine = [r for r in rows if r.get("InterfaceAlias") == pdev] or rows
+    servers = []
+    for r in mine:
+        for s in as_list(r.get("ServerAddresses")):
+            if s and s not in servers and not str(s).lower().startswith("fec0"):
+                servers.append(s)
+    return {"resolv_conf": servers, "upstream": [], "search": [s for s in snap["suffix"] if s], "stub": False}
+
+
+def extras_win():
+    lines = [f"{a.get('Name')}: {a.get('InterfaceDescription')} ({a.get('LinkSpeed') or '?'}, {a.get('Status') or '?'})"
+             for a in win_snapshot()["adapters"]]
+    return {"pci": lines} if lines else {}
+
+
+def wifi_scan_win():
+    r = run(["netsh", "wlan", "show", "networks", "mode=bssid"], 15)
+    nets, cur = [], None
+    for line in r["out"].splitlines():
+        s = line.strip()
+        m = re.match(r"^SSID\s+\d+\s*:\s*(.*)$", s)
+        if m:
+            cur = {"ssid": m.group(1), "signal": 0, "chan": "", "security": "open", "inuse": False}
+            nets.append(cur)
+        elif cur and ":" in s:
+            k, _, v = s.partition(":")
+            k, v = k.strip().lower(), v.strip()
+            if k.startswith("authentication"):
+                cur["security"] = v
+            elif k == "signal":
+                m = re.match(r"(\d+)", v)
+                if m:
+                    cur["signal"] = max(cur["signal"], int(m.group(1)))
+            elif k == "channel" and not cur["chan"]:
+                cur["chan"] = v
+    connected = {i.get("ssid") for i in wifi_links_win().values() if i.get("ssid")}
+    for n in nets:
+        n["inuse"] = n["ssid"] in connected
+    nets.sort(key=lambda n: -n["signal"])
+    note = "" if nets else (r["out"].strip() or r["err"].strip() or "No Wi-Fi networks found.")[:400]
+    return {"networks": nets, "note": note}
+
+
+def win_sweep(net):
+    hosts = [str(h) for h in net.hosts()]
+    # A UDP packet to each address makes Windows resolve its MAC, so devices that drop ping still show up.
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        for h in hosts:
+            try:
+                s.sendto(b"\x00", (h, 9))
+            except OSError:
+                pass
+        s.close()
+    except OSError:
+        pass
+    with cf.ThreadPoolExecutor(48) as ex:
+        res = list(ex.map(lambda h: run(["ping", "-n", "1", "-w", "700", h], 6), hosts))
+    return {h for h, r in zip(hosts, res) if "TTL=" in r["out"].upper()}
+
+
+def parse_tracert(out):
+    hops = []
+    for line in out.splitlines():
+        m = re.match(r"^\s*(\d+)\s+(.*\S)\s*$", line)
+        if not m:
+            continue
+        rest = m.group(2)
+        vals = [0.5 if lt else float(v) for lt, v in re.findall(r"(<?)\s*(\d+)\s*ms", rest)]
+        ips = re.findall(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", rest)
+        hops.append({"hop": int(m.group(1)), "host": ips[-1] if ips else "???",
+                     "loss": round(100 * (3 - min(len(vals), 3)) / 3),
+                     "avg": round(sum(vals) / len(vals), 1) if vals else None,
+                     "best": min(vals) if vals else None, "worst": max(vals) if vals else None})
+    return hops
+
+
+def parse_ping_win(out, sent):
+    vals = [0.5 if lt == "<" else float(v) for lt, v in re.findall(r"([=<])\s*(\d+)\s*ms\s+TTL=", out, re.I)]
+    sent = max(sent, 1)
+    p = {"loss": round(100.0 * (sent - min(len(vals), sent)) / sent, 1), "min": None, "avg": None, "max": None, "mdev": None}
+    if vals:
+        p.update(min=min(vals), avg=round(sum(vals) / len(vals), 2), max=max(vals),
+                 mdev=round(statistics.pstdev(vals), 2))
+    return p
+
+
+SOCK_STATES = {"ESTABLISHED": "ESTAB", "LISTEN": "LISTEN", "NONE": "UNCONN", "TIME_WAIT": "TIME-WAIT",
+               "CLOSE_WAIT": "CLOSE-WAIT", "SYN_SENT": "SYN-SENT", "SYN_RECV": "SYN-RECV", "FIN_WAIT1": "FIN-WAIT-1",
+               "FIN_WAIT2": "FIN-WAIT-2", "LAST_ACK": "LAST-ACK", "CLOSING": "CLOSING", "CLOSE": "CLOSED"}
+
+
+def win_socket_rows():
+    if psutil is None:
+        return []
+    names = {}
+
+    def pname(pid):
+        if pid not in names:
+            try:
+                names[pid] = psutil.Process(pid).name()
+            except Exception:  # noqa: BLE001
+                names[pid] = ""
+        return names[pid]
+
+    def fmt(a):
+        if not a:
+            return "*:*"
+        return f"[{a.ip}]:{a.port}" if ":" in a.ip else f"{a.ip}:{a.port}"
+    try:
+        conns = psutil.net_connections(kind="inet")
+    except Exception:  # noqa: BLE001
+        conns = []
+    return [{"proto": "tcp" if c.type == socket.SOCK_STREAM else "udp",
+             "state": SOCK_STATES.get(c.status, str(c.status).replace("_", "-")),
+             "local": fmt(c.laddr), "peer": fmt(c.raddr),
+             "process": pname(c.pid) if c.pid else "", "pid": str(c.pid or "")} for c in conns]
+
+
 # --------------------------------------------------------------------------
 # interfaces, routes, dns
 # --------------------------------------------------------------------------
@@ -222,6 +756,8 @@ def wifi_link(dev):
 
 
 def interfaces():
+    if IS_WIN:
+        return interfaces_win()
     addr = run_json(["ip", "-j", "addr"]) or []
     link = {l.get("ifname"): l for l in (run_json(["ip", "-j", "-s", "link"]) or [])}
     out = []
@@ -257,6 +793,8 @@ def interfaces():
 
 
 def routes():
+    if IS_WIN:
+        return routes_win()
     r4 = run_json(["ip", "-j", "route"]) or []
     r6 = run_json(["ip", "-j", "-6", "route"]) or []
     gws = [{"gateway": r.get("gateway"), "dev": r.get("dev"), "metric": r.get("metric", 0),
@@ -266,6 +804,8 @@ def routes():
 
 
 def dns_info():
+    if IS_WIN:
+        return dns_info_win()
     servers, search = [], []
     for line in (read("/etc/resolv.conf", "") or "").splitlines():
         p = line.split()
@@ -299,6 +839,8 @@ def primary():
 
 
 def extras():
+    if IS_WIN:
+        return extras_win()
     out = {}
     if have("lspci"):
         out["pci"] = [l for l in run(["lspci", "-nn"])["out"].splitlines()
@@ -316,8 +858,8 @@ def extras():
 def overview():
     gw, dev, iface, ifs, rt = primary()
     return remember("overview", {
-        "hostname": socket.gethostname(), "fqdn": socket.getfqdn(), "kernel": os.uname().release,
-        "user": os.environ.get("SUDO_USER") or os.environ.get("USER", ""), "root": IS_ROOT,
+        "hostname": socket.gethostname(), "fqdn": socket.getfqdn(), "kernel": pyplatform.platform(terse=True) if IS_WIN else pyplatform.release(), "platform": PLATFORM,
+        "user": os.environ.get("SUDO_USER") or os.environ.get("USER") or os.environ.get("USERNAME", ""), "root": IS_ROOT,
         "time": now(), "primary": dev, "gateway": gw, "interfaces": ifs, "routes": rt,
         "dns": dns_info(), "extras": extras(), "version": VERSION,
     })
@@ -333,16 +875,12 @@ def resolve_name(ip):
             return n, "DNS"
     except Exception:  # noqa: BLE001
         pass
-    if have("avahi-resolve-address"):
-        r = run(["avahi-resolve-address", ip], 3)
-        parts = r["out"].split()
-        if r["ok"] and len(parts) >= 2:
-            return parts[1], "mDNS"
-    if have("nmblookup"):
-        for line in run(["nmblookup", "-A", ip], 3)["out"].splitlines():
-            m = re.match(r"\s*(\S+)\s+<00>\s+-\s+(?!<GROUP>)", line)
-            if m:
-                return m.group(1), "NetBIOS"
+    n = mdns_name(ip)
+    if n:
+        return n, "mDNS"
+    n = nbns_name(ip)
+    if n:
+        return n, "NetBIOS"
     return "", ""
 
 
@@ -357,7 +895,10 @@ def discover():
     net = ifc.network if ifc.network.prefixlen >= 24 else ipaddress.ip_network(f"{ifc.ip}/24", strict=False)
     alive, method = set(), "neighbour table only"
     if net.num_addresses > 2:
-        if have("fping"):
+        if IS_WIN and not have("nmap"):
+            alive |= win_sweep(net)
+            method = "ping sweep"
+        elif have("fping"):
             r = run(["fping", "-a", "-q", "-r", "1", "-t", "300", "-g", str(net)], 90)
             alive |= {l.strip() for l in r["out"].splitlines() if l.strip()}
             method = "fping sweep"
@@ -374,7 +915,7 @@ def discover():
             method = "ping sweep"
     time.sleep(0.3)
     table = {}
-    for n in run_json(["ip", "-j", "neigh", "show", "dev", dev]) or []:
+    for n in neigh_table(dev):
         ip = n.get("dst", "")
         if ":" in ip:
             continue
@@ -502,6 +1043,11 @@ def parse_ping(out):
 
 
 def ping(host, count=4):
+    if IS_WIN:
+        r = run(["ping", "-n", str(count), "-w", "1000", host], count * 2 + 6)
+        p = parse_ping_win(r["out"], count)
+        p["host"] = host
+        return p
     r = run(["ping", "-n", "-c", str(count), "-i", "0.2", "-W", "1", "-w", str(max(4, count)), host], count + 8)
     p = parse_ping(r["out"])
     p["host"] = host
@@ -518,12 +1064,8 @@ def tcp_probe(host, port, timeout=3):
 
 
 def dns_probe(server, name):
-    t0 = time.time()
-    r = run(["dig", "+time=2", "+tries=1", "+short", f"@{server}", name, "A"], 6)
-    ms = round((time.time() - t0) * 1000)
-    ips = [l for l in r["out"].split() if re.match(r"^\d+\.\d+\.\d+\.\d+$", l)]
-    err = "" if ips else ((r["out"].strip().splitlines() or [r["err"].strip() or "no answer"])[-1])[:90]
-    return {"ok": bool(ips), "ms": ms, "err": err}
+    r = dns_query(server, name, 1, timeout=2.5)
+    return {"ok": r["ok"], "ms": r["ms"], "err": r.get("err", "")}
 
 
 def sys_resolve(name):
@@ -561,6 +1103,10 @@ def public_ip():
 
 def _df_ping(target, payload, count=1):
     """Ping with Don't Fragment set. Returns (passed, mtu_reported_by_router, local_error_mtu)."""
+    if IS_WIN:
+        r = run(["ping", "-f", "-l", str(payload), "-n", str(count), "-w", "1000", target], count * 2 + 4)
+        passed = "TTL=" in r["out"].upper()
+        return passed, (-1 if (not passed and "DF" in r["out"]) else None), None
     r = run(["ping", "-n", "-c", str(count), "-W", "1", "-M", "do", "-s", str(payload), target], count + 4)
     text = r["out"] + "\n" + r["err"]
     passed = parse_ping(r["out"])["loss"] < 100
@@ -592,6 +1138,8 @@ def mtu_probe(target, iface_mtu=None):
         else:
             hi = mid - 1
     mtu = best + 28 if best is not None else None
+    if reported == -1:  # Windows says "needs to be fragmented" but not the size
+        reported = mtu
     return {"full": False, "mtu": mtu, "iface_mtu": local, "pmtud": reported is not None,
             "reported": reported}
 
@@ -602,7 +1150,7 @@ def gateway_arp(gw, dev):
         if r["ok"]:
             m = re.search(r"([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})", r["out"])
             return True, f"Gateway {gw} answered ARP{(' from ' + m.group(1)) if m else ''}."
-    for e in run_json(["ip", "-j", "neigh", "show", gw]) or []:
+    for e in neigh_table(None if not IS_WIN else dev, gw):
         st = e.get("state") or []
         if e.get("lladdr") and not set(st) & {"FAILED", "INCOMPLETE"}:
             v = vendor(e["lladdr"])
@@ -644,17 +1192,17 @@ DOMAIN = {
                       ["Reseat or swap the patch cable and try a different switch port.",
                        "Check link lights on the NIC and the switch.",
                        "For Wi-Fi, confirm the SSID and password and move closer to the AP.",
-                       "Run: ethtool <iface> and ip link to confirm."]),
+                       W("Run: ethtool <iface> and ip link to confirm.", "In PowerShell, run: Get-NetAdapter | Format-List Name,Status,LinkSpeed")]),
     "IP address": ("IP addressing (DHCP)",
                    "The link is up but this host never got a usable IPv4 address.",
                    ["Confirm the DHCP server is up and the scope is not exhausted.",
                     "Check the switch port is on the right VLAN.",
-                    "Retry: sudo dhclient -v <iface> or nmcli con up <name>.",
+                    W("Retry: sudo dhclient -v <iface> or nmcli con up <name>.", "Retry: ipconfig /release, then ipconfig /renew."),
                     "Set a static IP temporarily to prove the segment works."]),
     "Default route": ("this machine's routing setup",
                       "There is no default gateway, so only the local subnet is reachable.",
                       ["Check DHCP option 3 (router) or the static config.",
-                       "Add one to test: sudo ip route add default via <gateway-ip>."]),
+                       W("Add one to test: sudo ip route add default via <gateway-ip>.", "Add one to test (as administrator): route add 0.0.0.0 mask 0.0.0.0 <gateway-ip>")]),
     "Gateway ARP": ("the local network segment or VLAN",
                     "This host cannot reach the gateway at layer 2.",
                     ["Verify the VLAN on the switch port and the subnet mask on this host.",
@@ -672,20 +1220,22 @@ DOMAIN = {
     "TCP egress": ("an outbound firewall or proxy policy",
                    "Ping gets out but TCP 443 does not, so something is filtering by port.",
                    ["Check firewall egress rules and any required web proxy.",
-                    "Check the host firewall: sudo iptables -L -n or sudo nft list ruleset."]),
+                    W("Check the host firewall: sudo iptables -L -n or sudo nft list ruleset.", "Check Windows Defender Firewall outbound rules (wf.msc).")]),
     "MTU / fragmentation": ("an MTU mismatch on the path",
                             "Full-size packets are being dropped.",
                             ["Common with VPNs, PPPoE and tunnels.",
                              "Lower the interface MTU to the exact value found, or enable TCP MSS clamping (MTU minus 40) on the router."]),
     "DNS servers": ("DNS",
-                    "None of the configured DNS servers answered.",
+                    "None of the configured DNS servers gave a usable answer.",
                     ["Check the DNS server or forwarder is running.",
-                     "Test a public resolver: dig @1.1.1.1 google.com.",
+                     W("Test a public resolver: dig @1.1.1.1 google.com.", "Test a public resolver: nslookup google.com 1.1.1.1"),
                      "Check UDP/TCP 53 is allowed outbound."]),
     "Name resolution": ("name lookups on this machine",
                         "The internet works by IP, but names do not resolve.",
-                        ["Check /etc/resolv.conf and systemd-resolved: resolvectl status.",
-                         "Try a public resolver to confirm: dig @1.1.1.1 google.com."]),
+                        [W("Check /etc/resolv.conf and systemd-resolved: resolvectl status.",
+                           "Run ipconfig /flushdns, then check the adapter's DNS servers with ipconfig /all."),
+                         W("Try a public resolver to confirm: dig @1.1.1.1 google.com.",
+                           "Try a public resolver to confirm: nslookup google.com 1.1.1.1")]),
     "HTTPS": ("web access, TLS or a proxy",
               "Basic connectivity is fine but HTTPS requests fail.",
               ["If the error mentions certificates, check the system clock and any SSL inspection.",
@@ -723,9 +1273,8 @@ def health():
         fut["net_" + t] = ex.submit(ping, t, 10)
     for t in targets:
         fut["tcp_" + t] = ex.submit(tcp_probe, t, 443)
-    if have("dig"):
-        for s in servers:
-            fut["dns_" + s] = ex.submit(dns_probe, s, names[0])
+    for s in servers:
+        fut["dns_" + s] = ex.submit(dns_probe, s, names[0])
     for nm in names:
         fut["sys_" + nm] = ex.submit(sys_resolve, nm)
     fut["https"] = ex.submit(http_probe, "https://www.google.com/generate_204")
@@ -743,7 +1292,7 @@ def health():
     if not iface:
         res["Physical link"] = C("Physical link", "fail",
                                  "No usable interface (nothing has an address or a default route).",
-                                 "Check the cable or Wi-Fi, then run: ip link")
+                                 "Check the cable or the Wi-Fi connection.")
     else:
         up = iface["state"] in ("UP", "UNKNOWN") and iface["carrier"] in ("1", None) and iface["state"] != "DOWN"
         if iface["carrier"] == "0":
@@ -786,7 +1335,7 @@ def health():
         res["Default route"] = C("Default route", "pass", f"Default route via {gw_ip} on {dev}")
     else:
         res["Default route"] = C("Default route", "fail", "No default route. Only the local subnet is reachable.",
-                                 "Check DHCP option 3 or add: sudo ip route add default via <gw>")
+                                 W("Check DHCP option 3 or add: sudo ip route add default via <gw>", "Check DHCP option 3 or the adapter's gateway setting."))
     # gateway
     if gw_ip:
         gp = get("gw")
@@ -850,9 +1399,12 @@ def health():
                                            f"Path MTU to {reach[0]} is exactly {m} bytes but this interface sends {im}, and nothing on the path "
                                            "reports the limit, so oversized packets vanish (an MTU black hole). Symptoms: pages that half-load, "
                                            "stalled downloads, SSH/VPN sessions that freeze on large output.",
-                                           f"Test now: sudo ip link set dev {dev} mtu {m}. If that fixes it, make it permanent with "
-                                           f"nmcli con mod \"<connection>\" 802-3-ethernet.mtu {m} (use 802-11-wireless.mtu on Wi-Fi), "
-                                           f"or better, enable TCP MSS clamping to {mss} on the router so every device is fixed.")
+                                           W(f"Test now: sudo ip link set dev {dev} mtu {m}. If that fixes it, make it permanent with "
+                                             f"nmcli con mod \"<connection>\" 802-3-ethernet.mtu {m} (use 802-11-wireless.mtu on Wi-Fi), "
+                                             f"or better, enable TCP MSS clamping to {mss} on the router so every device is fixed.",
+                                             f"Test now (as administrator): netsh interface ipv4 set subinterface \"{dev}\" mtu={m} store=active. "
+                                             f"If that fixes it, run it again with store=persistent, or better, enable TCP MSS clamping "
+                                             f"to {mss} on the router so every device is fixed."))
         else:
             res["MTU / fragmentation"] = C("MTU / fragmentation", "warn",
                                            f"Don't-fragment pings to {reach[0]} fail at every size while normal pings work. "
@@ -863,10 +1415,7 @@ def health():
     # DNS servers
     if not servers:
         res["DNS servers"] = C("DNS servers", "fail", "No DNS servers configured in /etc/resolv.conf.",
-                               "Set DNS via DHCP, NetworkManager or resolv.conf.")
-    elif not have("dig"):
-        res["DNS servers"] = C("DNS servers", "skip",
-                               f"Configured: {', '.join(servers)}. Install dnsutils (dig) to test each server on its own.")
+                               W("Set DNS via DHCP, NetworkManager or resolv.conf.", "Set DNS servers in the adapter settings or via DHCP."))
     else:
         results = [(s, get("dns_" + s)) for s in servers]
         good = [s for s, r in results if r and r["ok"]]
@@ -887,7 +1436,7 @@ def health():
                                    "DNS is slow: try a closer or faster resolver." if slow > 500 else "")
     else:
         res["Name resolution"] = C("Name resolution", "fail", detail,
-                                   "Check resolv.conf / resolvectl status, or test dig @1.1.1.1 google.com")
+                                   W("Check resolv.conf / resolvectl status, or test dig @1.1.1.1 google.com", "Run ipconfig /flushdns, or test nslookup google.com 1.1.1.1"))
     # HTTPS
     h = get("https")
     proxy = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
@@ -976,7 +1525,10 @@ def path(target):
     if not HOST_RE.match(target or ""):
         return {"error": "Invalid target", "hops": []}
     hops, method = [], ""
-    if have("mtr"):
+    if IS_WIN:
+        hops = parse_tracert(run(["tracert", "-d", "-w", "1000", "-h", "20", target], 90)["out"])
+        method = "tracert"
+    elif have("mtr"):
         j = run_json(["mtr", "--json", "-n", "-c", "5", target], 60)
         try:
             for h in j["report"]["hubs"]:
@@ -1013,7 +1565,7 @@ def path(target):
                              "loss": 0 if t is not None else 100, "avg": t, "best": t, "worst": t})
         method = "tracepath"
     if not hops:
-        return remember("path", {"target": target, "error": "No path tool worked here. Install mtr or traceroute.", "hops": []})
+        return remember("path", {"target": target, "error": W("No path tool worked here. Install mtr or traceroute.", "tracert returned nothing."), "hops": []})
     try:
         dest = socket.gethostbyname(target)
     except OSError:
@@ -1041,8 +1593,8 @@ def resolve_dns_only(ip):
 
 
 def sockets():
-    r = run(["ss", "-H", "-tunap"], 10)
-    rows = []
+    r = {"ok": True, "out": "", "err": ""} if IS_WIN else run(["ss", "-H", "-tunap"], 10)
+    rows = win_socket_rows() if IS_WIN else []
     for line in r["out"].splitlines():
         p = line.split()
         if len(p) < 6:
@@ -1058,13 +1610,16 @@ def sockets():
             return 0
     listening = sorted([x for x in rows if x["state"] in ("LISTEN", "UNCONN")], key=port_of)
     established = [x for x in rows if x["state"] == "ESTAB"]
-    note = "" if IS_ROOT else "Not running as root, so process names for other users' sockets are hidden."
+    note = "" if IS_ROOT else W("Not running as root, so process names for other users' sockets are hidden.",
+                                "Not running as administrator, so some program names may be missing.")
     if not rows and not r["ok"]:
         note = r["err"]
     return remember("sockets", {"all": rows[:3000], "listening": listening, "established": established[:1500], "note": note})
 
 
 def wifi_scan():
+    if IS_WIN:
+        return remember("wifi", wifi_scan_win())
     nets, note = [], ""
     if have("nmcli"):
         r = run(["nmcli", "-t", "-f", "IN-USE,SSID,CHAN,SIGNAL,SECURITY", "device", "wifi", "list"], 15)
@@ -1086,6 +1641,10 @@ def wifi_scan():
 
 
 def read_netdev():
+    if IS_WIN:
+        if psutil is None:
+            return {}
+        return {k: (v.bytes_recv, v.bytes_sent) for k, v in psutil.net_io_counters(pernic=True).items()}
     data = {}
     for line in (read("/proc/net/dev", "") or "").splitlines()[2:]:
         name, _, rest = line.partition(":")
@@ -1110,13 +1669,13 @@ def sampler():
 
 def traffic():
     with STATE_LOCK:
-        return {k: list(v) for k, v in TRAFFIC.items() if k != "lo"}
+        return {k: list(v) for k, v in TRAFFIC.items() if k != "lo" and not k.lower().startswith("loopback")}
 
 
 # --------------------------------------------------------------------------
 # console: run any of the tools with safe bounds
 # --------------------------------------------------------------------------
-CONSOLE_TIMEOUT = {"nmap": 180, "traceroute": 90, "mtr": 90, "tcpdump": 60, "tshark": 60, "ngrep": 60,
+CONSOLE_TIMEOUT = {"tracert": 120, "pathping": 300, "nmap": 180, "traceroute": 90, "mtr": 90, "tcpdump": 60, "tshark": 60, "ngrep": 60,
                    "iperf3": 60, "whois": 30, "lshw": 60}
 
 
@@ -1128,8 +1687,37 @@ def _has(args, *flags):
     return False
 
 
+def guard_win(tool, a):
+    low = [x.lower() for x in a]
+    if tool == "ping":
+        a = [x for x in a if x.lower() not in ("-t", "/t")]
+        if not any(x in ("-n", "/n") for x in low):
+            a = ["-n", "4"] + a
+    elif tool == "tracert":
+        if not any(x in ("-h", "/h") for x in low):
+            a = ["-h", "20"] + a
+        if not any(x in ("-w", "/w") for x in low):
+            a = ["-w", "1000"] + a
+    elif tool == "pathping" and not any(x in ("-q", "/q") for x in low):
+        a = ["-q", "10"] + a
+    elif tool == "netstat":
+        a = [x for x in a if not x.isdigit()]
+    elif tool == "tshark" and not _has(a, "-c", "-a") and "-D" not in a:
+        a = ["-c", "50"] + a
+    elif tool == "iperf3":
+        if "-s" in a and not _has(a, "-1"):
+            a.append("-1")
+        if _has(a, "-c") and not _has(a, "-t"):
+            a += ["-t", "5"]
+    elif tool in ("nslookup", "netsh") and not a:
+        return None, f"{tool} needs arguments here, or it waits for typed input. Try one of the examples."
+    return a, None
+
+
 def guard(tool, a):
     a = list(a)
+    if IS_WIN:
+        return guard_win(tool, a)
     if tool in ("ping", "arping", "hping3") and not _has(a, "-c"):
         a = ["-c", "4"] + a
     elif tool == "fping":
@@ -1176,7 +1764,7 @@ def console(tool, argstr):
     if tool not in {t[0] for t in TOOLS}:
         return {"error": "Unknown tool"}
     try:
-        args = shlex.split(argstr or "")
+        args = shlex.split(argstr or "", posix=not IS_WIN)
     except ValueError as e:
         return {"error": f"Could not parse arguments: {e}"}
     args, msg = guard(tool, args)
@@ -1380,6 +1968,15 @@ def main():
     ap.add_argument("--report", action="store_true", help="print a text report to the terminal and exit")
     args = ap.parse_args()
 
+    if IS_WIN and psutil is None:
+        print("NetPane on Windows needs psutil. Install it with:  pip install psutil")
+        sys.exit(1)
+    if IS_WIN:
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetConsoleTitleW("NetPane")
+        except Exception:  # noqa: BLE001
+            pass
     if args.report:
         overview(); health(); discover(); path("1.1.1.1"); sockets()
         print(text_report())
@@ -1389,16 +1986,25 @@ def main():
         ALLOWED_HOSTS.add(f"{h}:{args.port}")
     if args.bind in ("0.0.0.0", "::"):
         ALLOW_ANY_HOST = True
+    try:
+        srv = ThreadingHTTPServer((args.bind, args.port), Handler)
+    except OSError:
+        url = f"http://127.0.0.1:{args.port}/"
+        print(f"\n  Port {args.port} is already in use. NetPane may already be running: {url}")
+        print("  Start it with --port 8766 to run a second copy.")
+        if not args.no_browser:
+            open_browser(url)
+        return
     threading.Thread(target=sampler, daemon=True).start()
     threading.Thread(target=oui_db, daemon=True).start()
-    srv = ThreadingHTTPServer((args.bind, args.port), Handler)
     url = f"http://{'127.0.0.1' if args.bind in ('0.0.0.0', '::') else args.bind}:{args.port}/"
     print(f"\n  NetPane {VERSION} is running at {url}")
     if not IS_ROOT:
-        print("  Tip: start with sudo for arping, tcpdump, nethogs and full process names.")
+        print(W("  Tip: start with sudo for arping, tcpdump, nethogs and full process names.",
+                "  Tip: right-click and choose Run as administrator to see every program name."))
     if args.bind in ("0.0.0.0", "::"):
         print("  Warning: listening on all interfaces. Anyone who can reach this port can run network tools.")
-    print("  Press Ctrl+C to stop.\n")
+    print(W("  Press Ctrl+C to stop.\n", "  Close this window (or press Ctrl+C) to stop NetPane.\n"))
     if not args.no_browser:
         threading.Timer(1.0, open_browser, [url]).start()
     try:
@@ -1842,7 +2448,7 @@ try{const t=localStorage.getItem("np-theme");if(t)document.documentElement.datas
 /* ---------- overview ---------- */
 async function loadOverview(){
  try{const o=await api("/api/overview");S.ov=o;
-  $("#hostinfo").innerHTML=`<b>${esc(o.hostname)}</b><br>${esc(o.primary||"no network")}${o.root?"":`<br><span title="Start with sudo for arping, tcpdump, nethogs and process names">Limited mode (not root)</span>`}`;
+  $("#hostinfo").innerHTML=`<b>${esc(o.hostname)}</b><br>${esc(o.primary||"no network")}${o.root?"":`<br><span title="${o.platform==="windows"?"Run as administrator to see every program name":"Start with sudo for arping, tcpdump, nethogs and process names"}">Limited mode (not ${o.platform==="windows"?"administrator":"root"})</span>`}`;
   if(!S.tif)S.tif=o.primary;renderIfaces();renderRoutes();renderHw();renderFacts();drawTopo();
  }catch(e){fail("#ifaces",e);$("#hostinfo").textContent="Can't reach NetPane. Is it still running?"}}
 
@@ -1864,7 +2470,7 @@ function renderRoutes(){const o=S.ov;if(!o)return;const d=o.dns;
   ${d.search.length?`<dt>Search domains</dt><dd>${esc(d.search.join(", "))}</dd>`:""}
   <dt>Public IP</dt><dd class="mono">${esc(S.health?(S.health.public_ip||"Unknown"):"Checking")}</dd></dl>`}
 function renderHw(){const o=S.ov,e=o.extras||{};
- let x=`<dl class="dl" style="margin:0 0 12px"><dt>Hostname</dt><dd>${esc(o.fqdn)}</dd><dt>Kernel</dt><dd>${esc(o.kernel)}</dd><dt>Running as</dt><dd>${o.root?"root, full access":esc(o.user||"user")+", limited. Start with sudo for everything."}</dd></dl>`;
+ let x=`<dl class="dl" style="margin:0 0 12px"><dt>Hostname</dt><dd>${esc(o.fqdn)}</dd><dt>${o.platform==="windows"?"Windows":"Kernel"}</dt><dd>${esc(o.kernel)}</dd><dt>Running as</dt><dd>${o.root?(o.platform==="windows"?"Administrator, full access":"root, full access"):esc(o.user||"user")+(o.platform==="windows"?", limited. Run as administrator for everything.":", limited. Start with sudo for everything.")}</dd></dl>`;
  if(e.pci&&e.pci.length)x+=`<pre class="plain">${esc(e.pci.join("\n"))}</pre>`;
  if(e.nmcli&&e.nmcli.length)x+=`<div style="margin-top:12px">`+tbl([["Device",r=>esc(r[0])],["Type",r=>esc(r[1])],["State",r=>esc(r[2])],["Connection",r=>esc(r[3]||"")]],e.nmcli)+`</div>`;
  $("#hw").innerHTML=x;
@@ -2002,7 +2608,7 @@ const sigWord=d=>d>=-55?"Excellent":d>=-67?"Good":d>=-75?"Fair":"Weak";
 async function loadWifi(){try{S.wifi=await api("/api/wifi");renderWifi()}catch(e){fail("#wifi",e)}}
 function renderWifi(){const w=S.wifi||{networks:[]},cur=(S.ov?.interfaces||[]).filter(i=>i.wireless);
  if(!cur.length&&!w.networks.length){$("#wifi").innerHTML=`<div class="empty">This computer has no Wi-Fi adapter.</div>`;return}
- let x=cur.map(i=>`<div class="sbody"><dl class="dl" style="margin:0"><dt>${esc(i.name)}</dt><dd>${i.wifi&&i.wifi.ssid?`<b>${esc(i.wifi.ssid)}</b>, ${esc(i.wifi.signal)} dBm (${sigWord(i.wifi.signal)}), ${esc(i.wifi.freq||"?")} MHz, ${esc(i.wifi.bitrate||"")}`:'<span class="tag warn">Not connected</span>'}</dd></dl></div>`).join("");
+ let x=cur.map(i=>`<div class="sbody"><dl class="dl" style="margin:0"><dt>${esc(i.name)}</dt><dd>${i.wifi&&i.wifi.ssid?`<b>${esc(i.wifi.ssid)}</b>, ${i.wifi.signal_pct!=null?esc(i.wifi.signal_pct)+"% signal":esc(i.wifi.signal)+" dBm"} (${sigWord(i.wifi.signal)}), ${esc(i.wifi.freq?(/\d$/.test(i.wifi.freq)?i.wifi.freq+" MHz":i.wifi.freq):"")}${i.wifi.channel?", channel "+esc(i.wifi.channel):""}, ${esc(i.wifi.bitrate||"")}`:'<span class="tag warn">Not connected</span>'}</dd></dl></div>`).join("");
  if(w.networks.length){const ch=count(w.networks,n=>n.chan);
   x+=tbl([["Network",n=>`${n.inuse?'<span class="led ok" style="margin-right:8px"></span>':""}${esc(n.ssid||"Hidden network")}`],["Channel",n=>esc(n.chan)],["Signal",n=>`${esc(n.signal)}%`],["Security",n=>esc(n.security)]],w.networks.slice(0,15));
   x+=`<div class="sbody muted" style="font-size:12.5px">Most crowded channels: ${ch.slice(0,4).map(c=>`${esc(c[0])} (${c[1]} networks)`).join(", ")}</div>`}
@@ -2010,18 +2616,10 @@ function renderWifi(){const w=S.wifi||{networks:[]},cur=(S.ov?.interfaces||[]).f
  $("#wifi").innerHTML=x}
 
 /* ---------- tools & console ---------- */
-const PRESETS={ping:["-c 4 {gw}","-c 4 1.1.1.1","-c 4 google.com"],traceroute:["-n 1.1.1.1"],tracepath:["-n 1.1.1.1"],mtr:["-n 1.1.1.1","-n google.com"],
- hping3:["-S -p 443 -c 3 1.1.1.1"],fping:["-a -g {net}","-c 3 {gw} 1.1.1.1 8.8.8.8"],ip:["addr","route","neigh","-s link","rule"],ifconfig:["-a"],
- ethtool:["{dev}","-i {dev}","-S {dev}"],iw:["dev","dev {dev} link"],iwconfig:[""],nmcli:["device","connection show","device wifi list","general"],
- lspci:["-nn"],lshw:["-class network -short"],route:["-n"],arp:["-n"],arping:["-c 3 -I {dev} {gw}"],ss:["-tulpn","-tunap","-s"],netstat:["-tulpn","-i","-rn"],
- lsof:["-i -P -n"],nc:["-zv -w 3 {gw} 80","-zv -w 3 google.com 443"],dig:["google.com","+trace google.com","-x 8.8.8.8","MX gmail.com"],nslookup:["google.com"],
- host:["google.com"],whois:["8.8.8.8","google.com"],tcpdump:["-i {dev} -c 30","-i {dev} -c 30 port 53","-i {dev} -c 20 arp","-i {dev} -c 30 icmp"],
- tshark:["-i {dev} -c 30"],ngrep:["-d {dev} -q -n 20 GET"],nmap:["-sn {net}","-F {gw}","-sV -F {gw}"],iperf3:["-c <server> -t 5","-c <server> -R -t 5","-s"],
- iftop:["-i {dev}"],nethogs:["{dev}"],nload:[""],vnstat:["","-d","-h","-m"],"avahi-resolve-address":["{gw}"],nmblookup:["-A {gw}"]};
 async function loadTools(){try{const t=await api("/api/tools");S.tools=t.tools;renderTools(t);fillConsole()}catch(e){fail("#tools",e)}}
 function renderTools(t){$("#tcount").textContent=`${t.installed} of ${t.tools.length} installed`;
  const cats={};t.tools.forEach(x=>(cats[x.category]=cats[x.category]||[]).push(x));
- let x=t.install_cmd?`<div class="sbody" style="padding-bottom:4px"><div class="soft">Install the missing ones on Debian or Ubuntu:</div><div class="copy"><code id="icmd">${esc(t.install_cmd)}</code><button class="btn sm" id="copyb">Copy</button></div></div>`:"";
+ let x=t.install_cmd?`<div class="sbody" style="padding-bottom:4px"><div class="soft">${esc(t.install_hint)}</div><div class="copy"><code id="icmd">${esc(t.install_cmd)}</code><button class="btn sm" id="copyb">Copy</button></div></div>`:"";
  x+=Object.entries(cats).map(([c,a])=>`<div class="ghead" style="padding-top:16px">${esc(c)}</div><div class="toolgrid">${a.map(i=>`<div class="tool ${i.installed?"on":"off"}">${ic(i.installed?"check":"x")}<div><b>${esc(i.cmd)}</b><div>${esc(i.desc)}</div></div></div>`).join("")}</div>`).join("");
  $("#tools").innerHTML=x;
  const cb=$("#copyb");if(cb)cb.onclick=async()=>{try{await navigator.clipboard.writeText(t.install_cmd);cb.textContent="Copied"}catch(e){const r=document.createRange();r.selectNodeContents($("#icmd"));getSelection().removeAllRanges();getSelection().addRange(r);cb.textContent="Selected"}setTimeout(()=>cb.textContent="Copy",1500)}}
@@ -2031,7 +2629,7 @@ function fillConsole(){const sel=$("#ctool"),cur=sel.value;
 function vars(){const o=S.ov||{},dev=o.primary||"eth0",me=(o.interfaces||[]).find(i=>i.name===dev);
  return {gw:o.gateway?.gateway||"192.168.1.1",dev,net:S.neigh?.network||(me&&me.ipv4[0])||"192.168.1.0/24"}}
 function showPresets(){const t=$("#ctool").value,v=vars();
- $("#cpresets").innerHTML=(PRESETS[t]||[]).map(p=>{const a=p.replace(/\{(\w+)\}/g,(_,k)=>v[k]);return `<button data-preset="${esc(a)}">${esc((t+" "+a).trim())}</button>`}).join("")}
+ $("#cpresets").innerHTML=(((S.tools||[]).find(x=>x.cmd===t)||{}).presets||[]).map(p=>{const a=p.replace(/\{(\w+)\}/g,(_,k)=>v[k]);return `<button data-preset="${esc(a)}">${esc((t+" "+a).trim())}</button>`}).join("")}
 async function runTool(tool,args){const r=await api("/api/run",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({tool,args})});
  return `$ ${r.cmd}\n${r.out||""}${r.err?(r.out?"\n":"")+r.err:""}\n[exit ${r.rc}, ${r.seconds}s]`}
 async function consoleRun(){const t=$("#ctool").value,a=$("#cargs").value,o=$("#cout");if(!t)return;
@@ -2082,4 +2680,12 @@ runAll();
 """
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
+    except Exception:  # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+        if getattr(sys, "frozen", False):
+            input("\nNetPane hit an error. Press Enter to close this window.")

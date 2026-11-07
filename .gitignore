@@ -2,5 +2,9 @@ __pycache__/
 *.pyc
 netpane-*.txt
 netpane-*.json
+netpane-smoke.log
+build/
+dist/
+*.spec
 .venv/
 .DS_Store
