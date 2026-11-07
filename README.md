@@ -1,0 +1,101 @@
+# NetPane
+
+NetPane runs the usual Linux network troubleshooting tools for you, all at once, and tells you in one sentence where the problem is.
+
+![NetPane diagnosis view](docs/diagnosis.png)
+
+When someone says "the internet is down", the fault could be in a dozen places: the cable, the Wi-Fi, DHCP, the gateway, the ISP, DNS, a proxy. Checking each one by hand means running `ip`, `ping`, `arping`, `dig`, `mtr` and friends one after another and reading the output yourself. NetPane runs those checks in the order traffic actually travels, from your network card out to the web. The first check that fails is the fault, and every check that passed before it is ruled out.
+
+It is one Python file. It uses only the standard library, so there is nothing to `pip install`, and it doesn't load anything from the internet, so it still works when the network is the thing that's broken.
+
+## Quick start
+
+```bash
+curl -LO https://raw.githubusercontent.com/shanesenbradz/netpane/main/netpane.py
+sudo python3 netpane.py
+```
+
+Your browser opens to `http://127.0.0.1:8765`. Press **Run checks** any time to test again, and Ctrl+C in the terminal to stop it.
+
+Running with `sudo` is optional. Without it you still get most of the picture, but layer 2 checks (`arping`), packet capture, and the names of programs owning other users' connections need root.
+
+No browser on the box (a server over SSH)? Print the full report to the terminal instead:
+
+```bash
+sudo python3 netpane.py --report
+```
+
+## What it checks
+
+| Stage | Checks | If it passes, you can stop worrying about |
+|---|---|---|
+| Link | Carrier, speed, duplex, interface errors, Wi-Fi signal | The cable, switch port, NIC and Wi-Fi association |
+| Address | IPv4 address (catches 169.254 self-assigned), default route | DHCP and local routing |
+| Gateway | ARP reply and ping from the gateway | The VLAN, the LAN segment and the gateway itself |
+| Internet | Ping and TCP 443 to 1.1.1.1 and 8.8.8.8, path MTU | The router's WAN side, the ISP and outbound firewall rules |
+| DNS | Every configured DNS server on its own, then system name lookups | Each resolver, separately |
+| Web | HTTPS request, captive portal and transparent proxy detection | TLS, proxies and hotel-style login pages |
+| Quality | Loss, latency and jitter over 10 pings | A slow or flaky line |
+
+Some judgement is built in so you don't chase false alarms. A gateway that ignores ping but answers ARP is a warning, not a failure, because plenty of firewalls do that. A path MTU below 1500 only gets flagged when packets are being dropped silently (an MTU black hole), not when routers report the limit properly.
+
+## Everything else on screen
+
+- **Devices**: sweeps your subnet and lists every device with its name (from DNS, mDNS or NetBIOS), MAC address and maker. Click one to ping it, scan its ports or trace the route to it.
+- **Path**: hop-by-hop trace with loss and latency per router, and it points at the hop where loss starts and carries through to the end.
+- **Traffic**: live download and upload graph per interface, plus `vnstat` history if you have it.
+- **Connections**: listening ports, marked as reachable from the network or from this machine only, and which programs hold the most connections.
+- **Interfaces**: addresses, speeds, error counters, routing table, DNS settings, Wi-Fi and nearby networks.
+- **Tools**: a console for all 30 underlying tools with example commands. It adds safe limits automatically (packet counts, report mode, time limits) so nothing runs forever.
+- **Report**: downloads a plain-text report you can paste into a ticket or send to your ISP.
+
+![Devices view in dark mode](docs/devices-dark.png)
+
+## Requirements
+
+- Linux with Python 3.8 or newer (already installed on nearly every distro)
+- `iproute2` and `iputils-ping`, which almost every distro ships by default
+
+Everything else is optional. NetPane uses each tool when it finds it and quietly skips it when it doesn't. The Tools page lists what's missing and gives you the exact install command. On Debian or Ubuntu, this covers the lot:
+
+```bash
+sudo apt install -y fping mtr-tiny traceroute dnsutils nmap ethtool arping iw \
+  network-manager tcpdump tshark ngrep iperf3 iftop nethogs vnstat whois lsof \
+  netcat-openbsd net-tools pciutils lshw avahi-utils samba-common-bin
+```
+
+## Options
+
+```
+sudo python3 netpane.py [--port 8765] [--bind 127.0.0.1] [--no-browser] [--report]
+```
+
+| Option | What it does |
+|---|---|
+| `--port` | Port for the dashboard (default 8765) |
+| `--bind` | Address to listen on. Defaults to `127.0.0.1`, so only this machine can open it |
+| `--no-browser` | Don't open a browser on start |
+| `--report` | Run every check, print the text report and exit |
+
+## Security
+
+NetPane can run network tools as root, so by default it only listens on `127.0.0.1`. It refuses requests whose `Host` header doesn't match, which blocks DNS rebinding, and it refuses cross-origin POSTs. The console only runs the tools in its list, passes arguments without a shell, and adds time and packet limits.
+
+If you start it with `--bind 0.0.0.0` so you can open it from another machine, anyone who can reach that port can run those tools on your box. Only do that on a network you trust. A safer way to view it remotely is an SSH tunnel:
+
+```bash
+ssh -L 8765:127.0.0.1:8765 you@server
+```
+
+then open `http://127.0.0.1:8765` on your own machine.
+
+## Known limits
+
+- It is Linux only. It reads `/sys`, `/proc` and `ip -j` output directly.
+- The device sweep covers your primary interface's subnet, capped at a /24 on bigger networks so it finishes in reasonable time.
+- Device type guesses come from the MAC maker and open ports. They're a hint, not an inventory.
+- The internet checks use Cloudflare (1.1.1.1), Google (8.8.8.8) and Google's connectivity check URL. Networks that block those will show as failing even if other sites work.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).

@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+netpane-*.txt
+netpane-*.json
+.venv/
+.DS_Store
