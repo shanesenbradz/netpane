@@ -14,7 +14,7 @@ It is one Python file. On Linux it needs only the standard library, so there is 
 2. Double-click it. A small console window opens and your browser goes to `http://127.0.0.1:8765`.
 3. Close that console window when you're done.
 
-For the full picture (every program name on the Connections page), right-click `NetPane.exe` and choose **Run as administrator**.
+For the full picture (every program name on the Apps page), right-click `NetPane.exe` and choose **Run as administrator**.
 
 Windows SmartScreen may warn you the first time, because the exe isn't code-signed. Click **More info**, then **Run anyway**. If you'd rather not trust a downloaded exe, run the same file with Python instead: `pip install psutil`, then `python netpane.py`.
 
@@ -27,9 +27,17 @@ curl -LO https://raw.githubusercontent.com/shanesenbradz/netpane/main/netpane.py
 sudo python3 netpane.py
 ```
 
-Your browser opens to `http://127.0.0.1:8765`. Press **Run checks** any time to test again, and Ctrl+C in the terminal to stop it.
+NetPane opens in its own window, without tabs or an address bar, if you have Brave, Chrome, Chromium, Edge or Vivaldi. Otherwise it opens a normal browser tab. Closing the window stops NetPane. Press **Run checks** (or Ctrl+R) any time to test again.
 
-Running with `sudo` is optional. Without it you still get most of the picture, but layer 2 checks (`arping`), packet capture, and the names of programs owning other users' connections need root.
+Running with `sudo` is optional. Without it you still get most of the picture, but layer 2 checks (`arping`), packet capture, system services on the Apps page, and live speeds that include UDP need root.
+
+To add NetPane to your applications menu, run this once (without sudo):
+
+```bash
+python3 netpane.py --install
+```
+
+It then shows up like any other app. Right-click it and choose **Run with full access** to start it as root through your desktop's normal password prompt. `--uninstall` removes it again.
 
 No browser on the box (a server over SSH)? Print the full report to the terminal instead:
 
@@ -56,10 +64,30 @@ Some judgement is built in so you don't chase false alarms. A gateway that ignor
 - **Devices**: sweeps your subnet and lists every device with its name (from DNS, mDNS or NetBIOS), MAC address and maker. Click one to ping it, scan its ports or trace the route to it.
 - **Path**: hop-by-hop trace with loss and latency per router, and it points at the hop where loss starts and carries through to the end.
 - **Traffic**: live download and upload graph per interface, plus `vnstat` history if you have it.
-- **Connections**: listening ports, marked as reachable from the network or from this machine only, and which programs hold the most connections.
+- **Apps**: every program on this computer with a network connection open, with its PIDs, user, connection count, listening ports, live download and upload speed, and the server it's talking to most. Switch between one row per app (Brave's many processes grouped together) and one row per PID. Click a program to see every connection it holds, with the remote server's name. Right-click to copy PIDs.
 - **Interfaces**: addresses, speeds, error counters, routing table, DNS settings, Wi-Fi and nearby networks.
 - **Tools**: a console for all 30 underlying tools with example commands. It adds safe limits automatically (packet counts, report mode, time limits) so nothing runs forever.
 - **Report**: downloads a plain-text report you can paste into a ticket or send to your ISP.
+
+![Apps page, every program on the network with its PIDs](docs/apps.png)
+
+### How the Apps speeds work
+
+For TCP, NetPane reads the kernel's own byte counters for each connection (`ss -i`) and works out the speed from how fast they grow. That's exact, needs no root, and costs almost nothing. Browsers send a good share of traffic (YouTube, Google services) over QUIC, which is UDP, and the kernel doesn't keep those counters for UDP. So when `nethogs` is installed and NetPane runs as root, it also runs `nethogs` in the background and uses whichever figure is higher for each program. That picks up the UDP traffic. On Windows, the Apps page shows PIDs and connections, but not live speeds yet.
+
+## Keyboard shortcuts
+
+| Keys | Does |
+|---|---|
+| Ctrl+R or F5 | Run all checks again |
+| Ctrl+1 to Ctrl+7 | Switch page |
+| `/` or Ctrl+F | Jump to the page's filter or search box |
+| Up and Down | Move through table rows |
+| Enter | Open the selected row |
+| Shift+F10 or right-click | Row menu: copy PID, copy IP, ping, scan, trace |
+| Ctrl+S | Save the text report |
+| Esc | Close panels and menus |
+| `?` | Show these shortcuts |
 
 ![Devices view in dark mode](docs/devices-dark.png)
 
@@ -79,7 +107,8 @@ sudo apt install -y fping mtr-tiny traceroute dnsutils nmap ethtool arping iw \
 ## Options
 
 ```
-sudo python3 netpane.py [--port 8765] [--bind 127.0.0.1] [--no-browser] [--report]
+sudo python3 netpane.py [--port 8765] [--bind 127.0.0.1] [--no-browser] [--tab] [--keep-running] [--report]
+python3 netpane.py --install | --uninstall
 NetPane.exe [--port 8765] [--bind 127.0.0.1] [--no-browser] [--report]
 ```
 
@@ -87,8 +116,12 @@ NetPane.exe [--port 8765] [--bind 127.0.0.1] [--no-browser] [--report]
 |---|---|
 | `--port` | Port for the dashboard (default 8765) |
 | `--bind` | Address to listen on. Defaults to `127.0.0.1`, so only this machine can open it |
-| `--no-browser` | Don't open a browser on start |
-| `--report` | Run every check, print the text report and exit |
+| `--no-browser` | Don't open a window on start (for servers and SSH tunnels). NetPane keeps running until Ctrl+C |
+| `--tab` | Open in a normal browser tab instead of its own window |
+| `--keep-running` | Keep running after the NetPane window is closed |
+| `--report` | Run every check, print the text report (including every program on the network and its PID) and exit |
+| `--install`, `--uninstall` | Add or remove NetPane in your Linux applications menu |
+| `--version` | Print the version |
 
 ## Security
 

@@ -98,6 +98,14 @@ try:
     have = {x["cmd"] for x in tl["tools"] if x["installed"]}
     check({"ping", "tracert", "ipconfig", "netsh", "netstat", "nslookup"} <= have, "built-in Windows tools detected", sorted(have))
 
+    print("\n== apps")
+    ap = get("/api/apps")
+    for x in ap["apps"][:6]:
+        print(f"    pid {x['pid']:<6} {x['app']:<22} {x['user']:<14} conns {x['conns']} listen {x['listening'][:3]}")
+    mine = [x for x in ap["apps"] if x["app"] == "NetPane"]
+    check(bool(mine), "Apps page lists NetPane's own process and PID", [m["pid"] for m in mine])
+    check(any("8765/tcp" in m["listening"] for m in mine), "NetPane's listening port is attributed to it")
+
     print("\n== path")
     p = get("/api/path?target=127.0.0.1")
     check(len(p["hops"]) >= 1, "tracert parsed", p["hops"][:2])
