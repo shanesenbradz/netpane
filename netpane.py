@@ -46,7 +46,7 @@ try:
 except ImportError:  # optional on Linux, bundled in the Windows exe
     psutil = None
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 IS_WIN = os.name == "nt"
 PLATFORM = "windows" if IS_WIN else "linux"
 
@@ -1030,6 +1030,117 @@ def scan_host(ip):
             vend = h.get("vendor", "")
     g = guess_type(ports, vend)
     return {"ip": ip, "method": method, "ports": sorted(ports, key=lambda x: x["port"]), "guess": g, "kind": device_kind(g)}
+
+
+# --------------------------------------------------------------------------
+# SSH launcher: open a terminal with "ssh user@host" ready to go
+#
+# NetPane never handles the password. It builds the exact ssh command and
+# opens the machine's own terminal, so the key exchange and the password
+# prompt happen in that terminal, under the logged-in user, not in the web
+# UI and not as root. This is a convenience for logging in to kit you
+# administer (routers, switches, servers), nothing more.
+# --------------------------------------------------------------------------
+SSH_USER_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
+# Linux terminals, in order of preference. Each entry is (binary, args-before-command).
+# The ssh command is appended as one final string argument after these args.
+_LINUX_TERMS = [
+    ("x-terminal-emulator", ["-e"]),
+    ("gnome-terminal", ["--"]),
+    ("konsole", ["-e"]),
+    ("xfce4-terminal", ["-x"]),
+    ("mate-terminal", ["-x"]),
+    ("tilix", ["-e"]),
+    ("kitty", []),
+    ("alacritty", ["-e"]),
+    ("foot", []),
+    ("xterm", ["-e"]),
+]
+
+
+def _ssh_argv(host, user, port):
+    """The ssh command as a list, with options that make an interactive login behave."""
+    argv = ["ssh"]
+    if port and int(port) != 22:
+        argv += ["-p", str(int(port))]
+    # Ask for a password politely, never hang forever on an unreachable host.
+    argv += ["-o", "ConnectTimeout=10", "-o", "NumberOfPasswordPrompts=3"]
+    argv.append(f"{user}@{host}" if user else host)
+    return argv
+
+
+def _terminal_ssh(host, user, port):
+    """Open the system terminal running ssh. Returns (ok, terminal_name_or_error)."""
+    argv = _ssh_argv(host, user, port)
+    ssh_str = " ".join(shlex.quote(c) for c in argv)
+
+    if IS_WIN:
+        # start a new console window that stays open after ssh exits (/k)
+        try:
+            subprocess.Popen(["cmd", "/c", "start", "", "cmd", "/k", ssh_str],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             stdin=subprocess.DEVNULL, shell=False)
+            return True, "Windows console", ssh_str
+        except OSError as e:
+            return False, f"Could not open a console: {e}", ssh_str
+
+    if sys.platform == "darwin":
+        script = f'tell application "Terminal" to do script "{ssh_str}" activate'
+        try:
+            subprocess.Popen(["osascript", "-e", script],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             stdin=subprocess.DEVNULL)
+            return True, "Terminal.app", ssh_str
+        except OSError as e:
+            return False, f"Could not open Terminal: {e}", ssh_str
+
+    # Linux: keep the window open after ssh finishes so any error is readable.
+    held = f"{ssh_str}; echo; echo '[ssh session ended — press Enter to close]'; read _"
+    for binary, pre in _LINUX_TERMS:
+        if not have(binary):
+            continue
+        if binary in ("gnome-terminal", "tilix", "xfce4-terminal", "mate-terminal"):
+            cmd = [binary] + pre + ["bash", "-lc", held]
+        elif binary in ("kitty", "foot"):
+            cmd = [binary, "bash", "-lc", held]
+        else:  # x-terminal-emulator, konsole, alacritty, xterm
+            cmd = [binary] + pre + [f"bash -lc {shlex.quote(held)}"]
+        if _launch_as_user(cmd):
+            return True, binary, ssh_str
+    return False, "no-terminal", ssh_str
+
+
+def ssh_launch(host, user, port):
+    """Validate the request and open a terminal. Never receives or forwards a password."""
+    host = (host or "").strip()
+    user = (user or "").strip()
+    # Accept an IP, or a plain hostname made of label characters. Nothing that
+    # could smuggle shell metacharacters or extra ssh options.
+    ok_host = False
+    try:
+        ipaddress.ip_address(host)
+        ok_host = True
+    except ValueError:
+        ok_host = bool(re.match(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,253}[A-Za-z0-9])?$", host))
+    if not ok_host:
+        return {"ok": False, "error": "That host is not a valid IP address or hostname."}
+    if user and not SSH_USER_RE.match(user):
+        return {"ok": False, "error": "Username can use letters, numbers, dot, dash and underscore only."}
+    try:
+        port = int(port or 22)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "Port must be a number."}
+    if not 1 <= port <= 65535:
+        return {"ok": False, "error": "Port must be between 1 and 65535."}
+
+    ok, term, ssh_str = _terminal_ssh(host, user, port)
+    if ok:
+        return {"ok": True, "terminal": term, "cmd": ssh_str,
+                "note": "A terminal window opened on this machine. Type the password there."}
+    if term == "no-terminal":
+        return {"ok": False, "no_terminal": True, "cmd": ssh_str,
+                "error": "No terminal program was found to open. Copy the command and run it yourself."}
+    return {"ok": False, "cmd": ssh_str, "error": term}
 
 
 # --------------------------------------------------------------------------
@@ -2228,6 +2339,9 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n) or b"{}")
             if self.path == "/api/run":
                 return self.send(200, console(str(body.get("tool", "")), str(body.get("args", ""))))
+            if self.path == "/api/ssh":
+                return self.send(200, ssh_launch(str(body.get("host", "")), str(body.get("user", "")),
+                                                 body.get("port", 22)))
             self.send(404, {"error": "not found"})
         except Exception as e:  # noqa: BLE001
             self.send(500, {"error": f"{type(e).__name__}: {e}"})
@@ -2723,6 +2837,13 @@ canvas{display:block;width:100%}
 /* ---------- tools ---------- */
 .crow{display:flex;gap:6px;flex-wrap:wrap}
 .crow input{flex:1;min-width:220px;font-family:var(--mono);font-size:12.5px}
+.sshpanel{margin-top:10px;padding:12px;border:1px solid var(--line);border-radius:8px;background:var(--sunken);display:flex;flex-direction:column;gap:10px}
+.sshgrid{display:grid;grid-template-columns:1fr 90px;gap:8px}
+.sshgrid label{display:flex;flex-direction:column;gap:4px;font-size:11.5px;color:var(--ink-2)}
+.sshgrid input{font-family:var(--mono);font-size:12.5px}
+.sshcmdrow{background:#0D1319;color:#D7E0E8;border-radius:6px;padding:9px 11px;overflow:auto}
+.sshcmdrow code{color:#D7E0E8;white-space:pre-wrap;word-break:break-all;font-size:12.5px}
+#sshmsg:empty{display:none}
 .presets{display:flex;flex-wrap:wrap;gap:5px;margin-top:10px}
 .presets button{border:1px solid var(--line);background:var(--sunken);border-radius:5px;padding:3px 8px;font:11.5px var(--mono);color:var(--ink-2)}
 .presets button:hover{color:var(--ink);border-color:var(--ink-3)}
@@ -3139,9 +3260,38 @@ function showHost(ip){const h=(S.neigh?.hosts||[]).find(x=>x.ip===ip)||{ip,name:
  openDrawer(`<div class="dtop"><div class="devicon">${ic(kind)}</div><div><h2>${esc(h.name||"Unnamed device")}</h2><div class="muted mono">${esc(ip)}</div></div><button class="btn icon x" data-close aria-label="Close">${ic("x")}</button></div>
   <dl class="dl"><dt>Hardware address</dt><dd class="mono">${esc(h.mac||"Unknown")}</dd><dt>Maker</dt><dd>${esc(h.vendor||"Unknown")}</dd>
   <dt>Name from</dt><dd>${esc(h.name_source||"Not published")}</dd><dt>Role</dt><dd>${esc(h.role||"Device on this network")}</dd><dt>Neighbour state</dt><dd>${esc(h.state||"")}</dd><dt>Likely type</dt><dd id="dguess">Scan its ports to find out</dd></dl>
-  <div class="crow"><button class="btn" data-act="ping">Ping</button><button class="btn primary" data-act="scan">Scan ports</button><button class="btn" data-act="trace">Trace path</button><button class="btn" data-copy="${esc(ip)}">${ic("copy")}Copy IP</button></div>
+  <div class="crow"><button class="btn" data-act="ping">Ping</button><button class="btn primary" data-act="scan">Scan ports</button><button class="btn" data-act="trace">Trace path</button><button class="btn" id="sshbtn">${ic("keys")}SSH login</button><button class="btn" data-copy="${esc(ip)}">${ic("copy")}Copy IP</button></div>
+  <div id="sshbox"></div>
   <pre class="term" id="hout">Results appear here.</pre>`);
- $("#drawer").querySelectorAll("[data-act]").forEach(b=>b.onclick=()=>hostAction(ip,b.dataset.act,b))}
+ $("#drawer").querySelectorAll("[data-act]").forEach(b=>b.onclick=()=>hostAction(ip,b.dataset.act,b));
+ const sb=$("#sshbtn");if(sb)sb.onclick=()=>sshForm(ip)}
+function sshForm(ip){const box=$("#sshbox");if(!box)return;
+ if(box.dataset.open==="1"){box.dataset.open="0";box.innerHTML="";return}
+ box.dataset.open="1";
+ box.innerHTML=`<div class="sshpanel">
+   <div class="sshgrid">
+     <label>Username<input id="sshuser" class="field" placeholder="e.g. admin" autocomplete="off" spellcheck="false"></label>
+     <label>Port<input id="sshport" class="field" value="22" inputmode="numeric" autocomplete="off"></label>
+   </div>
+   <div class="sshcmdrow"><code id="sshcmd" class="mono"></code></div>
+   <div class="crow"><button class="btn primary" id="sshgo">${ic("play")}Open in terminal</button><button class="btn" id="sshcopy">${ic("copy")}Copy command</button></div>
+   <div class="soft">NetPane opens your terminal with this command ready. You type the password there. It is never sent to or stored by NetPane.</div>
+   <div id="sshmsg" class="soft"></div>
+ </div>`;
+ const u=$("#sshuser"),p=$("#sshport"),c=$("#sshcmd");
+ const build=()=>{const user=(u.value||"").trim(),port=(p.value||"").trim();
+   let cmd="ssh ";if(port&&port!=="22")cmd+="-p "+port+" ";cmd+=(user?user+"@":"")+ip;return cmd};
+ const paint=()=>{c.textContent=build()};paint();
+ u.oninput=paint;p.oninput=paint;u.focus();
+ $("#sshcopy").onclick=()=>copy(build(),"SSH command");
+ $("#sshgo").onclick=async b=>{const msg=$("#sshmsg"),user=(u.value||"").trim(),port=(p.value||"").trim()||"22";
+   if(!user){msg.innerHTML=`<span class="tag warn">Enter a username first</span>`;u.focus();return}
+   msg.textContent="Opening a terminal…";
+   try{const r=await api("/api/ssh",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({host:ip,user,port})});
+     if(r.ok){msg.innerHTML=`<span class="tag ok">Terminal opened (${esc(r.terminal)})</span> Type the password in that window.`;toast("SSH terminal opened")}
+     else if(r.no_terminal){msg.innerHTML=`<span class="tag warn">No terminal found.</span> Copy the command and run it in your own.`}
+     else{msg.innerHTML=`<span class="tag fail">${esc(r.error||"Could not open a terminal")}</span>`}}
+   catch(e){msg.innerHTML=`<span class="tag fail">${esc(e.message)}</span>`}}}
 async function hostAction(ip,act,b){const out=$("#hout");if(out)out.textContent="Running…";if(b)b.disabled=true;
  try{let t;if(act==="scan"){const r=await api("/api/scanhost?ip="+encodeURIComponent(ip));const g=$("#dguess");if(g)g.textContent=r.guess;
     t=`${r.method}\n\n`+(r.ports.length?"PORT    PROTO  SERVICE\n"+r.ports.map(p=>`${String(p.port).padEnd(8)}${p.proto.padEnd(7)}${p.service}`).join("\n"):"No open ports found.")}
