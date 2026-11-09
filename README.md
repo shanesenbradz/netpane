@@ -61,12 +61,13 @@ Some judgement is built in so you don't chase false alarms. A gateway that ignor
 
 ## Everything else on screen
 
-- **Devices**: sweeps your subnet and lists every device with its name (from DNS, mDNS or NetBIOS), MAC address and maker. Click one to ping it, scan its ports or trace the route to it.
+- **Devices**: sweeps your subnet and lists every device with its name (from DNS, mDNS or NetBIOS), MAC address and maker. Click one to ping it, scan its ports, trace the route to it, or open an SSH login. SSH opens your own terminal with `ssh user@host` ready, so you type the password there. NetPane never sees it.
 - **Path**: hop-by-hop trace with loss and latency per router, and it points at the hop where loss starts and carries through to the end.
 - **Traffic**: live download and upload graph per interface, plus `vnstat` history if you have it.
 - **Apps**: every program on this computer with a network connection open, with its PIDs, user, connection count, listening ports, live download and upload speed, and the server it's talking to most. Switch between one row per app (Brave's many processes grouped together) and one row per PID. Click a program to see every connection it holds, with the remote server's name. Right-click to copy PIDs.
-- **Interfaces**: addresses, speeds, error counters, routing table, DNS settings, Wi-Fi and nearby networks.
+- **Interfaces**: addresses, speeds, error counters, routing table, DNS settings, Wi-Fi and nearby networks. The VLAN card shows any 802.1Q tag this host carries, and whether the segment reaches the gateway and the internet. On an access port the switch strips the tag, so press **Listen for a switch** to learn the port or native VLAN from an LLDP or CDP advertisement (needs root, or lldpd installed).
 - **Tools**: a console for all 30 underlying tools with example commands. It adds safe limits automatically (packet counts, report mode, time limits) so nothing runs forever.
+- **Lookups**: passive, read-only intel on a domain, IP or host. DNS records with SPF and DMARC posture, WHOIS and RDAP, a TLS certificate inspector with expiry, ASN and BGP origin, and a public-exposure check (open ports and known CVEs) via Shodan's keyless InternetDB. Everything is a normal public query and nothing here touches the target beyond that.
 - **Report**: downloads a plain-text report you can paste into a ticket or send to your ISP.
 
 ![Apps page, every program on the network with its PIDs](docs/apps.png)
@@ -80,7 +81,7 @@ For TCP, NetPane reads the kernel's own byte counters for each connection (`ss -
 | Keys | Does |
 |---|---|
 | Ctrl+R or F5 | Run all checks again |
-| Ctrl+1 to Ctrl+7 | Switch page |
+| Ctrl+1 to Ctrl+8 | Switch page |
 | `/` or Ctrl+F | Jump to the page's filter or search box |
 | Up and Down | Move through table rows |
 | Enter | Open the selected row |
@@ -101,7 +102,7 @@ On Linux, everything else is optional. NetPane uses each tool when it finds it a
 ```bash
 sudo apt install -y fping mtr-tiny traceroute dnsutils nmap ethtool arping iw \
   network-manager tcpdump tshark ngrep iperf3 iftop nethogs vnstat whois lsof \
-  netcat-openbsd net-tools pciutils lshw avahi-utils samba-common-bin
+  netcat-openbsd net-tools pciutils lshw avahi-utils samba-common-bin lldpd
 ```
 
 ## Options
