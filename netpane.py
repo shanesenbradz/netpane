@@ -46,7 +46,7 @@ try:
 except ImportError:  # optional on Linux, bundled in the Windows exe
     psutil = None
 
-VERSION = "1.3.0"
+VERSION = "1.5.0"
 IS_WIN = os.name == "nt"
 PLATFORM = "windows" if IS_WIN else "linux"
 
@@ -1030,6 +1030,637 @@ def scan_host(ip):
             vend = h.get("vendor", "")
     g = guess_type(ports, vend)
     return {"ip": ip, "method": method, "ports": sorted(ports, key=lambda x: x["port"]), "guess": g, "kind": device_kind(g)}
+
+
+# --------------------------------------------------------------------------
+# SSH launcher: open a terminal with "ssh user@host" ready to go
+#
+# NetPane never handles the password. It builds the exact ssh command and
+# opens the machine's own terminal, so the key exchange and the password
+# prompt happen in that terminal, under the logged-in user, not in the web
+# UI and not as root. This is a convenience for logging in to kit you
+# administer (routers, switches, servers), nothing more.
+# --------------------------------------------------------------------------
+SSH_USER_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
+# Linux terminals, in order of preference. Each entry is (binary, args-before-command).
+# The ssh command is appended as one final string argument after these args.
+_LINUX_TERMS = [
+    ("x-terminal-emulator", ["-e"]),
+    ("gnome-terminal", ["--"]),
+    ("konsole", ["-e"]),
+    ("xfce4-terminal", ["-x"]),
+    ("mate-terminal", ["-x"]),
+    ("tilix", ["-e"]),
+    ("kitty", []),
+    ("alacritty", ["-e"]),
+    ("foot", []),
+    ("xterm", ["-e"]),
+]
+
+
+def _ssh_argv(host, user, port):
+    """The ssh command as a list, with options that make an interactive login behave."""
+    argv = ["ssh"]
+    if port and int(port) != 22:
+        argv += ["-p", str(int(port))]
+    # Ask for a password politely, never hang forever on an unreachable host.
+    argv += ["-o", "ConnectTimeout=10", "-o", "NumberOfPasswordPrompts=3"]
+    argv.append(f"{user}@{host}" if user else host)
+    return argv
+
+
+def _terminal_ssh(host, user, port):
+    """Open the system terminal running ssh. Returns (ok, terminal_name_or_error)."""
+    argv = _ssh_argv(host, user, port)
+    ssh_str = " ".join(shlex.quote(c) for c in argv)
+
+    if IS_WIN:
+        # start a new console window that stays open after ssh exits (/k)
+        try:
+            subprocess.Popen(["cmd", "/c", "start", "", "cmd", "/k", ssh_str],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             stdin=subprocess.DEVNULL, shell=False)
+            return True, "Windows console", ssh_str
+        except OSError as e:
+            return False, f"Could not open a console: {e}", ssh_str
+
+    if sys.platform == "darwin":
+        script = f'tell application "Terminal" to do script "{ssh_str}" activate'
+        try:
+            subprocess.Popen(["osascript", "-e", script],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             stdin=subprocess.DEVNULL)
+            return True, "Terminal.app", ssh_str
+        except OSError as e:
+            return False, f"Could not open Terminal: {e}", ssh_str
+
+    # Linux: keep the window open after ssh finishes so any error is readable.
+    held = f"{ssh_str}; echo; echo '[ssh session ended — press Enter to close]'; read _"
+    for binary, pre in _LINUX_TERMS:
+        if not have(binary):
+            continue
+        if binary in ("gnome-terminal", "tilix", "xfce4-terminal", "mate-terminal"):
+            cmd = [binary] + pre + ["bash", "-lc", held]
+        elif binary in ("kitty", "foot"):
+            cmd = [binary, "bash", "-lc", held]
+        else:  # x-terminal-emulator, konsole, alacritty, xterm
+            cmd = [binary] + pre + [f"bash -lc {shlex.quote(held)}"]
+        if _launch_as_user(cmd):
+            return True, binary, ssh_str
+    return False, "no-terminal", ssh_str
+
+
+def ssh_launch(host, user, port):
+    """Validate the request and open a terminal. Never receives or forwards a password."""
+    host = (host or "").strip()
+    user = (user or "").strip()
+    # Accept an IP, or a plain hostname made of label characters. Nothing that
+    # could smuggle shell metacharacters or extra ssh options.
+    ok_host = False
+    try:
+        ipaddress.ip_address(host)
+        ok_host = True
+    except ValueError:
+        ok_host = bool(re.match(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,253}[A-Za-z0-9])?$", host))
+    if not ok_host:
+        return {"ok": False, "error": "That host is not a valid IP address or hostname."}
+    if user and not SSH_USER_RE.match(user):
+        return {"ok": False, "error": "Username can use letters, numbers, dot, dash and underscore only."}
+    try:
+        port = int(port or 22)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "Port must be a number."}
+    if not 1 <= port <= 65535:
+        return {"ok": False, "error": "Port must be between 1 and 65535."}
+
+    ok, term, ssh_str = _terminal_ssh(host, user, port)
+    if ok:
+        return {"ok": True, "terminal": term, "cmd": ssh_str,
+                "note": "A terminal window opened on this machine. Type the password there."}
+    if term == "no-terminal":
+        return {"ok": False, "no_terminal": True, "cmd": ssh_str,
+                "error": "No terminal program was found to open. Copy the command and run it yourself."}
+    return {"ok": False, "cmd": ssh_str, "error": term}
+
+
+# --------------------------------------------------------------------------
+# Intel lookups: passive, public-data queries about domains, IPs and hosts.
+# Everything here is read-only and about infrastructure, not people. Most of
+# it needs no API key, in keeping with NetPane's light footprint.
+# --------------------------------------------------------------------------
+_DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(?:\.[A-Za-z0-9-]{1,63})+\.?$")
+
+
+def _is_ip(s):
+    try:
+        ipaddress.ip_address(s)
+        return True
+    except ValueError:
+        return False
+
+
+def _http_json(url, timeout=8):
+    """GET a URL and parse JSON. Returns (data, error)."""
+    req = urllib.request.Request(url, headers={"User-Agent": "NetPane/" + VERSION, "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", "replace")), None
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None, "not found (404)"
+        return None, f"HTTP {e.code}"
+    except Exception as e:  # noqa: BLE001
+        return None, str(getattr(e, "reason", e))
+
+
+def _resolver():
+    """Pick a usable resolver: the system one if it is a real server, else a public fallback."""
+    info = dns_info()
+    for s in info.get("resolv_conf", []) + info.get("upstream", []):
+        if not s.startswith("127."):
+            return s
+    return "1.1.1.1"
+
+
+# ----- DNS records (A, AAAA, NS, MX, SOA, TXT, CAA, SPF, DMARC) -----
+def _dns_records_query(server, name, qtype, timeout=3.0):
+    """A fuller DNS query than dns_query(): parses the record types a lookup needs."""
+    tid = random.randint(0, 0xFFFF)
+    pkt = struct.pack(">HHHHHH", tid, 0x0100, 1, 0, 0, 0) + _qname(name) + struct.pack(">HH", qtype, 1)
+    host = server.split("%")[0]
+    try:
+        s = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_DGRAM)
+    except OSError as e:
+        return {"rcode": -1, "err": str(e), "records": []}
+    t0 = time.time()
+    try:
+        s.settimeout(timeout)
+        s.sendto(pkt, (host, 53))
+        while True:
+            if time.time() - t0 > timeout:
+                raise socket.timeout()
+            s.settimeout(timeout - (time.time() - t0))
+            data, _ = s.recvfrom(8192)
+            if len(data) >= 12 and struct.unpack(">H", data[:2])[0] == tid:
+                break
+    except socket.timeout:
+        return {"rcode": -1, "err": "timed out", "records": []}
+    except OSError as e:
+        return {"rcode": -1, "err": str(e), "records": []}
+    finally:
+        s.close()
+    try:
+        rflags, qd, an = struct.unpack(">HHH", data[2:8])
+        off = 12
+        for _ in range(qd):
+            _, off = _dns_name(data, off)
+            off += 4
+        recs = []
+        for _ in range(an):
+            _, off = _dns_name(data, off)
+            rtype, _, _, rdlen = struct.unpack(">HHIH", data[off:off + 10])
+            off += 10
+            rd = data[off:off + rdlen]
+            if rtype == 1 and rdlen == 4:
+                recs.append(("A", socket.inet_ntoa(rd)))
+            elif rtype == 28 and rdlen == 16:
+                recs.append(("AAAA", socket.inet_ntop(socket.AF_INET6, rd)))
+            elif rtype == 2:
+                recs.append(("NS", _dns_name(data, off)[0].rstrip(".")))
+            elif rtype == 5:
+                recs.append(("CNAME", _dns_name(data, off)[0].rstrip(".")))
+            elif rtype == 15:
+                pref = struct.unpack(">H", rd[:2])[0]
+                recs.append(("MX", f"{pref} {_dns_name(data, off + 2)[0].rstrip('.')}"))
+            elif rtype == 6:
+                mname, o2 = _dns_name(data, off)
+                rname, o3 = _dns_name(data, o2)
+                serial = struct.unpack(">I", data[o3:o3 + 4])[0] if o3 + 4 <= len(data) else "?"
+                recs.append(("SOA", f"{mname.rstrip('.')} {rname.rstrip('.')} serial {serial}"))
+            elif rtype == 16:
+                txt, p = "", 0
+                while p < len(rd):
+                    ln = rd[p]
+                    txt += rd[p + 1:p + 1 + ln].decode("utf-8", "replace")
+                    p += 1 + ln
+                recs.append(("TXT", txt))
+            elif rtype == 257:
+                flags = rd[0]
+                tl = rd[1]
+                tag = rd[2:2 + tl].decode("ascii", "replace")
+                val = rd[2 + tl:].decode("utf-8", "replace")
+                recs.append(("CAA", f"{flags} {tag} \"{val}\""))
+            off += rdlen
+        return {"rcode": rflags & 0xF, "err": "", "records": recs}
+    except (ValueError, struct.error, IndexError):
+        return {"rcode": -1, "err": "malformed reply", "records": []}
+
+
+def dns_records(domain):
+    domain = (domain or "").strip().rstrip(".").lower()
+    if not _DOMAIN_RE.match(domain + "."):
+        return {"error": "Enter a domain name, for example example.com."}
+    server = _resolver()
+    sets = {}
+    for label, qt in [("A", 1), ("AAAA", 28), ("NS", 2), ("MX", 15), ("SOA", 6), ("TXT", 16), ("CAA", 257)]:
+        r = _dns_records_query(server, domain, qt)
+        vals = [v for (t, v) in r["records"]]
+        if vals:
+            sets[label] = vals
+    # Mail posture: SPF lives in the domain's TXT; DMARC in _dmarc.<domain>.
+    spf = [v for v in sets.get("TXT", []) if v.lower().startswith("v=spf1")]
+    dmarc_r = _dns_records_query(server, "_dmarc." + domain, 16)
+    dmarc = [v for (_, v) in dmarc_r["records"] if v.lower().startswith("v=dmarc1")]
+    mail = {
+        "spf": spf[0] if spf else "",
+        "dmarc": dmarc[0] if dmarc else "",
+        "spf_note": "present" if spf else "no SPF record found",
+        "dmarc_note": "present" if dmarc else "no DMARC record found",
+    }
+    return {"domain": domain, "resolver": server, "records": sets, "mail": mail}
+
+
+# ----- WHOIS over port 43 (domains and IPs), following IANA referral -----
+def _whois_raw(server, query, timeout=8):
+    try:
+        with socket.create_connection((server, 43), timeout) as s:
+            s.sendall((query + "\r\n").encode())
+            buf = b""
+            s.settimeout(timeout)
+            while len(buf) < 200000:
+                try:
+                    chunk = s.recv(8192)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+            return buf.decode("utf-8", "replace")
+    except OSError as e:
+        return f"__error__ {e}"
+
+
+def whois_lookup(target):
+    target = (target or "").strip().lower().rstrip(".")
+    is_ip = _is_ip(target)
+    if not is_ip and not _DOMAIN_RE.match(target + "."):
+        return {"error": "Enter a domain name or IP address."}
+    # IANA knows which whois server is authoritative; follow its referral once.
+    top = _whois_raw("whois.iana.org", target)
+    refer = ""
+    for line in top.splitlines():
+        m = re.match(r"(?:refer|whois):\s*(\S+)", line.strip(), re.I)
+        if m:
+            refer = m.group(1)
+            break
+    text = top
+    server = "whois.iana.org"
+    if refer and not refer.startswith("__error__"):
+        second = _whois_raw(refer, target)
+        if second and not second.startswith("__error__"):
+            text = second
+            server = refer
+    if text.startswith("__error__"):
+        return {"error": "WHOIS server did not answer.", "detail": text}
+    # Trim the long legal boilerplate most registries append.
+    lines = [l for l in text.splitlines() if not l.strip().startswith("%") and not l.strip().startswith("#")]
+    trimmed = "\n".join(lines).strip()
+    if len(trimmed) > 6000:
+        trimmed = trimmed[:6000] + "\n...[truncated]"
+    return {"target": target, "server": server, "kind": "ip" if is_ip else "domain", "text": trimmed}
+
+
+# ----- RDAP (structured WHOIS) via the public rdap.org bootstrap -----
+def rdap_lookup(target):
+    target = (target or "").strip().lower().rstrip(".")
+    is_ip = _is_ip(target)
+    if not is_ip and not _DOMAIN_RE.match(target + "."):
+        return {"error": "Enter a domain name or IP address."}
+    kind = "ip" if is_ip else "domain"
+    data, err = _http_json(f"https://rdap.org/{kind}/{target}", timeout=10)
+    if err:
+        return {"error": f"RDAP lookup failed: {err}"}
+    out = {"target": target, "kind": kind, "handle": data.get("handle", ""), "name": data.get("name", ""),
+           "status": data.get("status", []), "events": [], "entities": []}
+    for ev in data.get("events", []):
+        out["events"].append({"action": ev.get("eventAction", ""), "date": ev.get("eventDate", "")})
+    for ent in data.get("entities", []):
+        roles = ent.get("roles", [])
+        name = ent.get("handle", "")
+        vc = ent.get("vcardArray")
+        if isinstance(vc, list) and len(vc) > 1:
+            for field in vc[1]:
+                if isinstance(field, list) and field and field[0] == "fn":
+                    name = field[3] if len(field) > 3 else name
+        out["entities"].append({"roles": roles, "name": name})
+    if is_ip:
+        out["range"] = f"{data.get('startAddress', '')} - {data.get('endAddress', '')}"
+        out["country"] = data.get("country", "")
+    return out
+
+
+# ----- TLS/SSL certificate inspector -----
+def tls_cert(host, port=443):
+    import ssl
+    host = (host or "").strip()
+    if ":" in host and not _is_ip(host):
+        host, _, p = host.partition(":")
+        if p.isdigit():
+            port = int(p)
+    if not host or (not _is_ip(host) and not _DOMAIN_RE.match(host + ".")):
+        return {"error": "Enter a hostname or IP address."}
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE  # we inspect the cert, we are not validating a connection
+    try:
+        with socket.create_connection((host, port), timeout=8) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host if not _is_ip(host) else None) as ss:
+                cert = ss.getpeercert(binary_form=False)
+                der = ss.getpeercert(binary_form=True)
+                cipher = ss.cipher()
+                proto = ss.version()
+    except ssl.SSLError as e:
+        return {"error": f"TLS handshake failed: {e}"}
+    except OSError as e:
+        return {"error": f"Could not connect to {host}:{port}: {e}"}
+    if not cert and der:
+        # Rare: no parsed dict (self-signed under some stacks). Report what we can.
+        return {"host": host, "port": port, "proto": proto, "cipher": cipher[0] if cipher else "",
+                "note": "The peer presented a certificate that could not be parsed into fields (often self-signed)."}
+    subj = {k: v for t in cert.get("subject", []) for (k, v) in t}
+    issuer = {k: v for t in cert.get("issuer", []) for (k, v) in t}
+    sans = [v for (t, v) in cert.get("subjectAltName", []) if t == "DNS"]
+    not_after = cert.get("notAfter", "")
+    days_left = None
+    try:
+        exp = ssl.cert_time_to_seconds(not_after)
+        days_left = round((exp - time.time()) / 86400)
+    except Exception:  # noqa: BLE001
+        pass
+    return {"host": host, "port": port, "proto": proto, "cipher": cipher[0] if cipher else "",
+            "subject": subj.get("commonName", ""), "issuer": issuer.get("commonName", "") or issuer.get("organizationName", ""),
+            "valid_from": cert.get("notBefore", ""), "valid_to": not_after, "days_left": days_left,
+            "sans": sans[:50], "san_count": len(sans)}
+
+
+# ----- ASN / BGP origin via Team Cymru's whois service -----
+def asn_lookup(ip):
+    ip = (ip or "").strip()
+    if not _is_ip(ip):
+        return {"error": "Enter an IP address."}
+    # Cymru bulk mode returns: AS | IP | BGP prefix | CC | registry | allocated | AS name
+    q = f"begin\nverbose\n{ip}\nend\n"
+    try:
+        with socket.create_connection(("whois.cymru.com", 43), timeout=8) as s:
+            s.sendall(q.encode())
+            buf = b""
+            s.settimeout(8)
+            while True:
+                try:
+                    chunk = s.recv(4096)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+    except OSError as e:
+        return {"error": f"ASN lookup failed: {e}"}
+    lines = [l for l in buf.decode("utf-8", "replace").splitlines() if l and "|" in l]
+    data = [l for l in lines if not l.lower().startswith("as ")]
+    if not data:
+        return {"error": "No ASN data returned for that IP."}
+    f = [x.strip() for x in data[0].split("|")]
+    if len(f) < 7:
+        return {"error": "Unexpected ASN response.", "raw": data[0]}
+    return {"ip": f[1], "asn": f[0], "prefix": f[2], "country": f[3], "registry": f[4],
+            "allocated": f[5], "as_name": f[6]}
+
+
+# ----- Public exposure via Shodan's free, keyless InternetDB -----
+def exposure_lookup(ip):
+    ip = (ip or "").strip()
+    if not _is_ip(ip):
+        return {"error": "Enter an IP address."}
+    if ipaddress.ip_address(ip).is_private:
+        return {"error": "That is a private address. InternetDB only indexes public IPs."}
+    data, err = _http_json(f"https://internetdb.shodan.io/{ip}", timeout=10)
+    if err == "not found (404)":
+        return {"ip": ip, "ports": [], "hostnames": [], "tags": [], "vulns": [], "cpes": [],
+                "note": "Shodan has nothing indexed for this address. Often that means it exposes nothing public."}
+    if err:
+        return {"error": f"Exposure lookup failed: {err}"}
+    return {"ip": data.get("ip", ip), "ports": data.get("ports", []), "hostnames": data.get("hostnames", []),
+            "tags": data.get("tags", []), "vulns": data.get("vulns", []), "cpes": data.get("cpes", [])}
+
+
+LOOKUPS = {"dns": lambda t: dns_records(t), "whois": lambda t: whois_lookup(t),
+           "rdap": lambda t: rdap_lookup(t), "tls": lambda t: tls_cert(t),
+           "asn": lambda t: asn_lookup(t), "exposure": lambda t: exposure_lookup(t)}
+
+
+def lookup(kind, target):
+    fn = LOOKUPS.get(kind)
+    if not fn:
+        return {"error": "Unknown lookup."}
+    target = (target or "").strip()
+    if not target:
+        return {"error": "Enter a target first."}
+    if len(target) > 255 or any(c in target for c in " \t\r\n\"'`;|&$<>()"):
+        return {"error": "That target has characters that are not allowed."}
+    try:
+        return fn(target)
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+# --------------------------------------------------------------------------
+# VLAN: what 802.1Q tag, if any, this host sits on, and whether a switch is
+# telling us the port/native VLAN over LLDP or CDP.
+# --------------------------------------------------------------------------
+def vlan_tagged():
+    """802.1Q subinterfaces configured on this host (instant, no capture)."""
+    out = []
+    if IS_WIN:
+        # Best effort: adapters may expose a VlanID advanced property.
+        r = run(["powershell", "-NoProfile", "-Command",
+                 "Get-NetAdapterAdvancedProperty -DisplayName 'VLAN ID' -ErrorAction SilentlyContinue | "
+                 "Select-Object -Property Name,DisplayValue | ConvertTo-Json -Compress"], 10)
+        try:
+            data = json.loads(r["out"]) if r["out"].strip() else []
+            if isinstance(data, dict):
+                data = [data]
+            for a in data:
+                vid = str(a.get("DisplayValue", "")).strip()
+                if vid and vid != "0":
+                    out.append({"name": a.get("Name", ""), "id": vid, "parent": "", "protocol": "802.1Q"})
+        except (ValueError, TypeError):
+            pass
+        return out
+    links = run_json(["ip", "-d", "-j", "link", "show"]) or []
+    for l in links:
+        li = l.get("linkinfo") or {}
+        if li.get("info_kind") == "vlan":
+            idata = li.get("info_data") or {}
+            out.append({"name": l.get("ifname", ""), "id": idata.get("id"),
+                        "parent": l.get("link", ""), "protocol": idata.get("protocol", "802.1Q")})
+    if not out:  # fallback for older kernels
+        cfg = read("/proc/net/vlan/config", "") or ""
+        for line in cfg.splitlines():
+            if "|" in line and "VLAN" not in line.split("|")[0]:
+                p = [x.strip() for x in line.split("|")]
+                if len(p) >= 3 and p[1].isdigit():
+                    out.append({"name": p[0], "id": int(p[1]), "parent": p[2], "protocol": "802.1Q"})
+    return out
+
+
+def vlan_scan():
+    tagged = vlan_tagged()
+    return {"tagged": tagged, "has_tag": bool(tagged),
+            "lldp_supported": bool(have("lldpctl")) or (IS_ROOT and not IS_WIN),
+            "platform": PLATFORM, "is_root": IS_ROOT}
+
+
+def _lldp_id(subtype, rest):
+    if subtype == 4 and len(rest) == 6:  # MAC
+        return ":".join("%02x" % b for b in rest)
+    try:
+        s = rest.decode("utf-8")
+        if s.isprintable() and s:
+            return s
+    except UnicodeDecodeError:
+        pass
+    if len(rest) == 6:
+        return ":".join("%02x" % b for b in rest)
+    return rest.hex()
+
+
+def _parse_lldp(frame):
+    if len(frame) < 16 or frame[12:14] != b"\x88\xcc":
+        return None
+    data = frame[14:]
+    i, out, vlans = 0, {"proto": "LLDP"}, []
+    while i + 2 <= len(data):
+        h = int.from_bytes(data[i:i + 2], "big")
+        ttype, tlen = h >> 9, h & 0x1FF
+        i += 2
+        val = data[i:i + tlen]
+        i += tlen
+        if ttype == 0:
+            break
+        if ttype == 1 and val:
+            out["chassis"] = _lldp_id(val[0], val[1:])
+        elif ttype == 2 and val:
+            out["port"] = _lldp_id(val[0], val[1:])
+        elif ttype == 4:
+            out["port_descr"] = val.decode("utf-8", "replace")
+        elif ttype == 5:
+            out["system"] = val.decode("utf-8", "replace")
+        elif ttype == 127 and len(val) >= 4 and val[0:3] == b"\x00\x80\xc2":
+            sub, body = val[3], val[4:]
+            if sub == 1 and len(body) >= 2:
+                out["pvid"] = int.from_bytes(body[0:2], "big")
+            elif sub == 3 and len(body) >= 3:
+                vid = int.from_bytes(body[0:2], "big")
+                nlen = body[2]
+                vlans.append({"id": vid, "name": body[3:3 + nlen].decode("utf-8", "replace")})
+    if vlans:
+        out["vlans"] = vlans
+    return out
+
+
+def _parse_cdp(frame):
+    if len(frame) < 22 or frame[0:6] != b"\x01\x00\x0c\xcc\xcc\xcc":
+        return None
+    data = frame[14:]
+    if data[:8] != b"\xaa\xaa\x03\x00\x00\x0c\x20\x00":
+        return None
+    cdp = data[8:]
+    i, out = 4, {"proto": "CDP"}
+    while i + 4 <= len(cdp):
+        ttype = int.from_bytes(cdp[i:i + 2], "big")
+        tlen = int.from_bytes(cdp[i + 2:i + 4], "big")
+        if tlen < 4 or i + tlen > len(cdp):
+            break
+        val = cdp[i + 4:i + tlen]
+        i += tlen
+        if ttype == 0x0001:
+            out["system"] = val.decode("utf-8", "replace")
+        elif ttype == 0x0003:
+            out["port"] = val.decode("utf-8", "replace")
+        elif ttype == 0x000A and len(val) >= 2:
+            out["native_vlan"] = int.from_bytes(val[0:2], "big")
+    return out
+
+
+def _lldpctl_neighbors():
+    r = run(["lldpctl", "-f", "keyvalue"], 8)
+    if not r["ok"] or not r["out"].strip():
+        return []
+    ifaces = {}
+    for line in r["out"].splitlines():
+        if "=" not in line or not line.startswith("lldp."):
+            continue
+        key, _, val = line.partition("=")
+        parts = key.split(".")
+        if len(parts) < 3:
+            continue
+        ifc = ifaces.setdefault(parts[1], {"proto": "LLDP", "iface": parts[1]})
+        rest = ".".join(parts[2:])
+        if rest == "chassis.name":
+            ifc["system"] = val
+        elif rest == "port.descr":
+            ifc["port_descr"] = val
+        elif rest in ("port.ifname", "port.local"):
+            ifc.setdefault("port", val)
+        elif rest == "vlan.vlan-id":
+            ifc["pvid"] = val
+    return list(ifaces.values())
+
+
+def lldp_listen(timeout=65):
+    """Learn the switch, port and VLAN from one LLDP or CDP advertisement."""
+    if have("lldpctl"):
+        n = _lldpctl_neighbors()
+        if n:
+            return {"ok": True, "source": "lldpctl", "neighbors": n}
+    if IS_WIN:
+        return {"ok": False, "reason": "Windows has no built-in LLDP capture. Install lldpd, or read the VLAN off the switch."}
+    if not IS_ROOT:
+        return {"ok": False, "reason": "Listening for LLDP/CDP needs root. Start NetPane with sudo, or install lldpd."}
+    try:
+        s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
+    except (AttributeError, OSError) as e:
+        return {"ok": False, "reason": f"Raw capture is not available here: {e}"}
+    timeout = max(10, min(int(timeout), 80))
+    deadline = time.time() + timeout
+    lldp = cdp = None
+    try:
+        gw, dev, iface, ifs, rt = primary()
+        if dev:
+            try:
+                s.bind((dev, 0))
+            except OSError:
+                pass
+        while time.time() < deadline and not (lldp and cdp):
+            s.settimeout(max(0.5, min(deadline - time.time(), 5)))
+            try:
+                frame = s.recv(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if not lldp:
+                lldp = _parse_lldp(frame)
+            if not cdp:
+                cdp = _parse_cdp(frame)
+    finally:
+        s.close()
+    neigh = [x for x in (lldp, cdp) if x]
+    if not neigh:
+        return {"ok": True, "source": "capture", "neighbors": [],
+                "note": "No LLDP or CDP frame arrived in the listening window. The switch may not run either, "
+                        "or the port has discovery turned off."}
+    return {"ok": True, "source": "capture", "neighbors": neigh}
 
 
 # --------------------------------------------------------------------------
@@ -2187,7 +2818,7 @@ class Handler(BaseHTTPRequestHandler):
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
         simple = {"/api/overview": overview, "/api/health": health, "/api/neighbors": discover,
                   "/api/sockets": sockets, "/api/tools": tool_inventory, "/api/wifi": wifi_scan,
-                  "/api/traffic": traffic, "/api/apps": apps}
+                  "/api/traffic": traffic, "/api/apps": apps, "/api/vlan": vlan_scan}
         try:
             if u.path in ("/", "/index.html"):
                 return self.send(200, INDEX_HTML, "text/html")
@@ -2200,6 +2831,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, path(q.get("target", "1.1.1.1")))
             if u.path == "/api/scanhost":
                 return self.send(200, scan_host(q.get("ip", "")))
+            if u.path == "/api/lookup":
+                return self.send(200, lookup(q.get("kind", ""), q.get("target", "")))
+            if u.path == "/api/lldp":
+                return self.send(200, lldp_listen(int(q.get("t", "65") or 65)))
             stamp = dt.datetime.now().strftime("%Y%m%d-%H%M")
             if u.path == "/api/report.txt":
                 return self.send(200, text_report(), "text/plain",
@@ -2228,6 +2863,9 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n) or b"{}")
             if self.path == "/api/run":
                 return self.send(200, console(str(body.get("tool", "")), str(body.get("args", ""))))
+            if self.path == "/api/ssh":
+                return self.send(200, ssh_launch(str(body.get("host", "")), str(body.get("user", "")),
+                                                 body.get("port", 22)))
             self.send(404, {"error": "not found"})
         except Exception as e:  # noqa: BLE001
             self.send(500, {"error": f"{type(e).__name__}: {e}"})
@@ -2723,6 +3361,13 @@ canvas{display:block;width:100%}
 /* ---------- tools ---------- */
 .crow{display:flex;gap:6px;flex-wrap:wrap}
 .crow input{flex:1;min-width:220px;font-family:var(--mono);font-size:12.5px}
+.sshpanel{margin-top:10px;padding:12px;border:1px solid var(--line);border-radius:8px;background:var(--sunken);display:flex;flex-direction:column;gap:10px}
+.sshgrid{display:grid;grid-template-columns:1fr 90px;gap:8px}
+.sshgrid label{display:flex;flex-direction:column;gap:4px;font-size:11.5px;color:var(--ink-2)}
+.sshgrid input{font-family:var(--mono);font-size:12.5px}
+.sshcmdrow{background:#0D1319;color:#D7E0E8;border-radius:6px;padding:9px 11px;overflow:auto}
+.sshcmdrow code{color:#D7E0E8;white-space:pre-wrap;word-break:break-all;font-size:12.5px}
+#sshmsg:empty{display:none}
 .presets{display:flex;flex-wrap:wrap;gap:5px;margin-top:10px}
 .presets button{border:1px solid var(--line);background:var(--sunken);border-radius:5px;padding:3px 8px;font:11.5px var(--mono);color:var(--ink-2)}
 .presets button:hover{color:var(--ink);border-color:var(--ink-3)}
@@ -2846,6 +3491,7 @@ pre.plain{margin:0;font:11.5px/1.5 var(--mono);white-space:pre-wrap;color:var(--
    <button data-go="interfaces" title="Interfaces (Ctrl+6)"><svg class="i"><use href="#i-port"/></svg>Interfaces</button>
    <hr>
    <button data-go="tools" title="Tools (Ctrl+7)"><svg class="i"><use href="#i-console"/></svg>Tools</button>
+   <button data-go="lookups" title="Lookups (Ctrl+8)"><svg class="i"><use href="#i-search"/></svg>Lookups</button>
   </nav>
   <div class="side-foot" id="hostinfo">Connecting…</div>
  </aside>
@@ -2913,6 +3559,7 @@ pre.plain{margin:0;font:11.5px/1.5 var(--mono);white-space:pre-wrap;color:var(--
   <section class="view" id="v-interfaces" hidden data-sub="Network adapters, addresses, routing and DNS on this computer.">
    <div class="vtools" data-tools></div>
    <div class="sheet"><div id="ifaces"><div class="loading">Reading interfaces</div></div></div>
+   <div class="sheet"><div class="shead"><h2>VLAN &amp; segment</h2><button class="btn sm" id="lldpbtn">Listen for a switch (LLDP/CDP)</button></div><div class="sbody" id="vlan"><div class="loading">Checking for a VLAN tag</div></div></div>
    <div class="split">
     <div class="sheet"><div class="shead"><h2>Routing table</h2></div><div id="routes"></div></div>
     <div class="sheet"><div class="shead"><h2>DNS</h2></div><div class="sbody" id="dns"></div></div>
@@ -2932,6 +3579,16 @@ pre.plain{margin:0;font:11.5px/1.5 var(--mono);white-space:pre-wrap;color:var(--
     <pre class="term" id="cout">Choose a tool, then press Run or pick one of the examples.</pre>
    </div></div>
    <div class="sheet"><div class="shead"><h2>Installed tools</h2><span class="hint" id="tcount"></span></div><div id="tools"></div></div>
+  </section>
+
+  <!-- LOOKUPS -->
+  <section class="view" id="v-lookups" hidden data-sub="Public, read-only intel on a domain, IP or host. Nothing here touches the target beyond a normal query.">
+   <div class="vtools" data-tools></div>
+   <div class="sheet"><div class="sbody">
+    <div class="crow"><input class="field" id="lktarget" placeholder="Domain, IP or host (example.com, 8.8.8.8)" aria-label="Lookup target" autocomplete="off" spellcheck="false"><button class="btn" data-lk="dns">DNS records</button><button class="btn" data-lk="whois">WHOIS</button><button class="btn" data-lk="rdap">RDAP</button><button class="btn" data-lk="tls">TLS cert</button><button class="btn" data-lk="asn">ASN / BGP</button><button class="btn" data-lk="exposure">Exposure</button></div>
+    <div class="soft" style="margin-top:6px">DNS, WHOIS and RDAP take a domain or IP. TLS takes a host (optionally host:port). ASN and Exposure take an IP.</div>
+   </div></div>
+   <div class="sheet" id="lkresult" hidden><div class="shead"><h2 id="lktitle"></h2><span class="hint" id="lksub"></span></div><div class="sbody" id="lkbody"></div></div>
   </section>
 
   </div>
@@ -2999,8 +3656,8 @@ document.addEventListener("click",e=>{const th=e.target.closest("[data-tsort]");
  S.sort[id]={k,dir:cur&&cur.k===k&&cur.dir==="asc"?"desc":(cur&&cur.k===k?"asc":(th.classList.contains("r")?"desc":"asc"))};(S.rerender[id]||(()=>{}))()});
 
 /* ---------- navigation, toolbar, title ---------- */
-const VIEWS=["diagnosis","devices","path","apps","traffic","interfaces","tools"];
-const TITLES={diagnosis:"Diagnosis",devices:"Devices",path:"Path",apps:"Apps",traffic:"Traffic",interfaces:"Interfaces",tools:"Tools"};
+const VIEWS=["diagnosis","devices","path","apps","traffic","interfaces","tools","lookups"];
+const TITLES={diagnosis:"Diagnosis",devices:"Devices",path:"Path",apps:"Apps",traffic:"Traffic",interfaces:"Interfaces",tools:"Tools",lookups:"Lookups"};
 function go(v){if(v==="connections")v="apps";if(!TITLES[v])v="diagnosis";
  const prev=S.view;S.view=v;closeCtx();
  $$(".view").forEach(x=>x.hidden=x.id!=="v-"+v);
@@ -3012,7 +3669,7 @@ function go(v){if(v==="connections")v="apps";if(!TITLES[v])v="diagnosis";
  $("#bartitle").textContent=TITLES[v];$("#barsub").textContent=sec.dataset.sub||"";
  if(location.hash.slice(1)!==v)history.replaceState(null,"","#"+v);
  $("#content").scrollTop=0;
- if(v==="traffic")drawChart();if(v==="tools")showPresets();
+ if(v==="traffic")drawChart();if(v==="tools")showPresets();if(v==="interfaces")loadVlan();if(v==="lookups")$("#lktarget").focus();
  if(v==="apps"||v==="traffic")startApps();else if(prev==="apps"||prev==="traffic")stopApps()}
 function setTheme(t){const r=document.documentElement;if(t)r.dataset.theme=t;else delete r.dataset.theme;
  try{t?localStorage.setItem("np-theme",t):localStorage.removeItem("np-theme")}catch(e){}
@@ -3139,9 +3796,38 @@ function showHost(ip){const h=(S.neigh?.hosts||[]).find(x=>x.ip===ip)||{ip,name:
  openDrawer(`<div class="dtop"><div class="devicon">${ic(kind)}</div><div><h2>${esc(h.name||"Unnamed device")}</h2><div class="muted mono">${esc(ip)}</div></div><button class="btn icon x" data-close aria-label="Close">${ic("x")}</button></div>
   <dl class="dl"><dt>Hardware address</dt><dd class="mono">${esc(h.mac||"Unknown")}</dd><dt>Maker</dt><dd>${esc(h.vendor||"Unknown")}</dd>
   <dt>Name from</dt><dd>${esc(h.name_source||"Not published")}</dd><dt>Role</dt><dd>${esc(h.role||"Device on this network")}</dd><dt>Neighbour state</dt><dd>${esc(h.state||"")}</dd><dt>Likely type</dt><dd id="dguess">Scan its ports to find out</dd></dl>
-  <div class="crow"><button class="btn" data-act="ping">Ping</button><button class="btn primary" data-act="scan">Scan ports</button><button class="btn" data-act="trace">Trace path</button><button class="btn" data-copy="${esc(ip)}">${ic("copy")}Copy IP</button></div>
+  <div class="crow"><button class="btn" data-act="ping">Ping</button><button class="btn primary" data-act="scan">Scan ports</button><button class="btn" data-act="trace">Trace path</button><button class="btn" id="sshbtn">${ic("keys")}SSH login</button><button class="btn" data-copy="${esc(ip)}">${ic("copy")}Copy IP</button></div>
+  <div id="sshbox"></div>
   <pre class="term" id="hout">Results appear here.</pre>`);
- $("#drawer").querySelectorAll("[data-act]").forEach(b=>b.onclick=()=>hostAction(ip,b.dataset.act,b))}
+ $("#drawer").querySelectorAll("[data-act]").forEach(b=>b.onclick=()=>hostAction(ip,b.dataset.act,b));
+ const sb=$("#sshbtn");if(sb)sb.onclick=()=>sshForm(ip)}
+function sshForm(ip){const box=$("#sshbox");if(!box)return;
+ if(box.dataset.open==="1"){box.dataset.open="0";box.innerHTML="";return}
+ box.dataset.open="1";
+ box.innerHTML=`<div class="sshpanel">
+   <div class="sshgrid">
+     <label>Username<input id="sshuser" class="field" placeholder="e.g. admin" autocomplete="off" spellcheck="false"></label>
+     <label>Port<input id="sshport" class="field" value="22" inputmode="numeric" autocomplete="off"></label>
+   </div>
+   <div class="sshcmdrow"><code id="sshcmd" class="mono"></code></div>
+   <div class="crow"><button class="btn primary" id="sshgo">${ic("play")}Open in terminal</button><button class="btn" id="sshcopy">${ic("copy")}Copy command</button></div>
+   <div class="soft">NetPane opens your terminal with this command ready. You type the password there. It is never sent to or stored by NetPane.</div>
+   <div id="sshmsg" class="soft"></div>
+ </div>`;
+ const u=$("#sshuser"),p=$("#sshport"),c=$("#sshcmd");
+ const build=()=>{const user=(u.value||"").trim(),port=(p.value||"").trim();
+   let cmd="ssh ";if(port&&port!=="22")cmd+="-p "+port+" ";cmd+=(user?user+"@":"")+ip;return cmd};
+ const paint=()=>{c.textContent=build()};paint();
+ u.oninput=paint;p.oninput=paint;u.focus();
+ $("#sshcopy").onclick=()=>copy(build(),"SSH command");
+ $("#sshgo").onclick=async b=>{const msg=$("#sshmsg"),user=(u.value||"").trim(),port=(p.value||"").trim()||"22";
+   if(!user){msg.innerHTML=`<span class="tag warn">Enter a username first</span>`;u.focus();return}
+   msg.textContent="Opening a terminal…";
+   try{const r=await api("/api/ssh",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({host:ip,user,port})});
+     if(r.ok){msg.innerHTML=`<span class="tag ok">Terminal opened (${esc(r.terminal)})</span> Type the password in that window.`;toast("SSH terminal opened")}
+     else if(r.no_terminal){msg.innerHTML=`<span class="tag warn">No terminal found.</span> Copy the command and run it in your own.`}
+     else{msg.innerHTML=`<span class="tag fail">${esc(r.error||"Could not open a terminal")}</span>`}}
+   catch(e){msg.innerHTML=`<span class="tag fail">${esc(e.message)}</span>`}}}
 async function hostAction(ip,act,b){const out=$("#hout");if(out)out.textContent="Running…";if(b)b.disabled=true;
  try{let t;if(act==="scan"){const r=await api("/api/scanhost?ip="+encodeURIComponent(ip));const g=$("#dguess");if(g)g.textContent=r.guess;
     t=`${r.method}\n\n`+(r.ports.length?"PORT    PROTO  SERVICE\n"+r.ports.map(p=>`${String(p.port).padEnd(8)}${p.proto.padEnd(7)}${p.service}`).join("\n"):"No open ports found.")}
@@ -3281,6 +3967,90 @@ function renderAppDrawer(live){const d=S.apps;if(!d)return;const key=S.drawerApp
 /* ---------- wifi ---------- */
 const sigWord=d=>d>=-55?"Excellent":d>=-67?"Good":d>=-75?"Fair":"Weak";
 async function loadWifi(){try{S.wifi=await api("/api/wifi");renderWifi()}catch(e){fail("#wifi",e)}}
+
+/* ---------- VLAN & segment ---------- */
+async function loadVlan(){try{S.vlan=await api("/api/vlan");renderVlan()}catch(e){fail("#vlan",e)}}
+function renderVlan(){const v=S.vlan;if(!v)return;S.rerender.vlan=renderVlan;
+ const h=S.health,st=nm=>(h?.checks||[]).find(c=>c.name===nm)?.status;
+ const gwOk=[st("Gateway ping"),st("Gateway ARP")].includes("pass"),netOk=st("Internet by IP")==="pass";
+ const chip=(ok,on,off)=>`<span class="tag ${ok?"ok":"warn"}">${ok?on:off}</span>`;
+ let access=h?`<div style="margin-bottom:10px">Segment access: ${chip(gwOk,"gateway reachable","gateway not answering")} ${chip(netOk,"internet reachable","no internet")}</div>`:"";
+ let body;
+ if(v.tagged&&v.tagged.length){
+  body=`<div class="soft" style="margin-bottom:8px">This host has 802.1Q VLAN interface${v.tagged.length>1?"s":""} configured:</div>`+
+   table([{k:"n",label:"Interface",render:x=>`<span class="mono">${esc(x.name)}</span>`},
+    {k:"id",label:"VLAN ID",render:x=>`<span class="tag ok">${esc(String(x.id))}</span>`},
+    {k:"p",label:"On NIC",render:x=>`<span class="mono">${esc(x.parent||"?")}</span>`},
+    {k:"pr",label:"Tagging",render:x=>esc(x.protocol||"802.1Q")}],v.tagged,{id:"vlantbl"});
+ }else{
+  body=`<div class="note">${ic("info")}<div>This host sees no 802.1Q VLAN tag. Either you are on an untagged (access) port, or this NIC is not doing VLAN tagging. On an access port the switch removes the tag before the frame reaches you, so the host cannot read the VLAN number on its own. Use <b>Listen for a switch</b> to learn the port or native VLAN from LLDP or CDP, if the switch advertises it.</div></div>`;
+ }
+ let hint="";
+ if(!v.lldp_supported)hint=`<div class="soft" style="margin-top:8px">LLDP/CDP listening needs either lldpd installed or NetPane running as ${v.platform==="windows"?"administrator with lldpd":"root"}.</div>`;
+ $("#vlan").innerHTML=access+body+`<div id="lldpout" style="margin-top:10px"></div>`+hint;
+ const b=$("#lldpbtn");if(b)b.disabled=!v.lldp_supported}
+async function listenLldp(b){const out=$("#lldpout");if(b)b.disabled=true;
+ if(out)out.innerHTML=`<div class="loading">Listening for a switch advertisement. This can take up to a minute.</div>`;
+ try{const r=await api("/api/lldp?t=65");
+  if(!r.ok){if(out)out.innerHTML=`<div class="note">${ic("alert")}<div>${esc(r.reason||"Could not listen.")}</div></div>`;return}
+  if(!r.neighbors||!r.neighbors.length){if(out)out.innerHTML=`<div class="note">${ic("info")}<div>${esc(r.note||"No switch advertisement was heard.")}</div></div>`;return}
+  const row=x=>{const bits=[];
+    if(x.pvid!=null)bits.push(`<span class="tag ok">Port VLAN ${esc(String(x.pvid))}</span>`);
+    if(x.native_vlan!=null)bits.push(`<span class="tag ok">Native VLAN ${esc(String(x.native_vlan))}</span>`);
+    (x.vlans||[]).forEach(vl=>bits.push(`<span class="chip">VLAN ${esc(String(vl.id))} ${esc(vl.name||"")}</span>`));
+    return `<div class="sheet" style="margin-top:8px"><div class="sbody"><dl class="dl">
+     <dt>Heard over</dt><dd>${esc(x.proto)}${x.iface?" on "+esc(x.iface):""}</dd>
+     <dt>Switch</dt><dd>${esc(x.system||"not advertised")}</dd>
+     <dt>Switch port</dt><dd class="mono">${esc(x.port||x.port_descr||"not advertised")}</dd>
+     <dt>VLAN</dt><dd>${bits.length?bits.join(" "):"not advertised"}</dd></dl></div></div>`};
+  if(out)out.innerHTML=`<div class="soft">Learned from ${esc(r.source==="lldpctl"?"lldpd":"a live capture")}:</div>`+r.neighbors.map(row).join("")}
+ catch(e){if(out)out.innerHTML=`<div class="note">${ic("alert")}<div>${esc(e.message)}</div></div>`}
+ finally{if(b)b.disabled=false}}
+
+/* ---------- Lookups (intel) ---------- */
+async function runLookup(kind){const t=($("#lktarget").value||"").trim();if(!t){toast("Enter a target first");$("#lktarget").focus();return}
+ const titles={dns:"DNS records",whois:"WHOIS",rdap:"RDAP",tls:"TLS certificate",asn:"ASN / BGP",exposure:"Public exposure"};
+ $("#lkresult").hidden=false;$("#lktitle").textContent=titles[kind];$("#lksub").textContent=t;
+ $("#lkbody").innerHTML=`<div class="loading">Looking up ${esc(t)}</div>`;
+ $("#lkresult").scrollIntoView({behavior:"smooth",block:"nearest"});
+ try{const r=await api("/api/lookup?kind="+kind+"&target="+encodeURIComponent(t));renderLookup(kind,r)}
+ catch(e){$("#lkbody").innerHTML=`<div class="note">${ic("alert")}<div>${esc(e.message)}</div></div>`}}
+function renderLookup(kind,r){const el=$("#lkbody");
+ if(r.error){el.innerHTML=`<div class="note">${ic("alert")}<div>${esc(r.error)}</div></div>`;return}
+ const dl=rows=>`<dl class="dl">${rows.map(([k,v])=>`<dt>${esc(k)}</dt><dd>${v}</dd>`).join("")}</dl>`;
+ const m=t=>`<span class="mono">${esc(t)}</span>`;
+ if(kind==="dns"){
+  const sets=r.records||{},order=["A","AAAA","NS","MX","SOA","TXT","CAA"];
+  let html=`<div class="soft" style="margin-bottom:8px">Resolver: ${m(r.resolver)}</div>`;
+  const mail=r.mail||{};
+  html+=dl([["SPF",mail.spf?m(mail.spf):`<span class="tag warn">none</span>`],["DMARC",mail.dmarc?m(mail.dmarc):`<span class="tag warn">none</span>`]]);
+  const got=order.filter(k=>sets[k]&&sets[k].length);
+  if(got.length)html+=got.map(k=>`<div style="margin-top:8px"><b>${k}</b><div>${sets[k].map(m).join("<br>")}</div></div>`).join("");
+  else html+=`<div class="soft" style="margin-top:8px">No records returned (the resolver may filter, or the name may not exist).</div>`;
+  el.innerHTML=html;return}
+ if(kind==="whois"||kind==="asn"&&r.raw){
+  if(kind==="whois"){el.innerHTML=`<div class="soft" style="margin-bottom:6px">Server: ${m(r.server)}</div><pre class="term" style="min-height:0">${esc(r.text||"")}</pre>`;return}}
+ if(kind==="asn"){el.innerHTML=dl([["AS number",`<span class="tag ok">AS${esc(r.asn)}</span>`],["AS name",esc(r.as_name||"")],["BGP prefix",m(r.prefix||"")],["Country",esc(r.country||"")],["Registry",esc((r.registry||"").toUpperCase())],["Allocated",esc(r.allocated||"")]]);return}
+ if(kind==="rdap"){const rows=[["Handle",m(r.handle||"-")],["Name",esc(r.name||"-")]];
+  if(r.range)rows.push(["Range",m(r.range)]);if(r.country)rows.push(["Country",esc(r.country)]);
+  if(r.status&&r.status.length)rows.push(["Status",r.status.map(s=>`<span class="chip">${esc(s)}</span>`).join(" ")]);
+  (r.events||[]).forEach(e=>rows.push([esc(e.action),esc((e.date||"").replace("T"," ").slice(0,19))]));
+  (r.entities||[]).slice(0,8).forEach(en=>rows.push([esc((en.roles||[]).join(", ")||"entity"),esc(en.name||"")]));
+  el.innerHTML=dl(rows);return}
+ if(kind==="tls"){if(r.note&&!r.subject){el.innerHTML=`<div class="note">${ic("info")}<div>${esc(r.note)}</div></div>`;return}
+  const dleft=r.days_left,chip=dleft==null?"":dleft<0?`<span class="tag fail">expired ${-dleft}d ago</span>`:dleft<=30?`<span class="tag warn">${dleft} days left</span>`:`<span class="tag ok">${dleft} days left</span>`;
+  const rows=[["Subject",esc(r.subject||"-")],["Issuer",esc(r.issuer||"-")],["Valid from",m(r.valid_from||"")],["Valid to",`${m(r.valid_to||"")} ${chip}`],["Protocol",esc(r.proto||"")+(r.cipher?" · "+esc(r.cipher):"")],["SAN count",esc(String(r.san_count||0))]];
+  let html=dl(rows);
+  if(r.sans&&r.sans.length)html+=`<div style="margin-top:8px"><b>Subject alternative names</b><div class="soft" style="margin-top:4px">${r.sans.map(s=>`<span class="chip">${esc(s)}</span>`).join(" ")}</div></div>`;
+  el.innerHTML=html;return}
+ if(kind==="exposure"){const rows=[["IP",m(r.ip||"")]];
+  rows.push(["Open ports",(r.ports&&r.ports.length)?r.ports.map(p=>`<span class="chip">${esc(String(p))}</span>`).join(" "):"none indexed"]);
+  if(r.hostnames&&r.hostnames.length)rows.push(["Hostnames",r.hostnames.map(m).join("<br>")]);
+  if(r.tags&&r.tags.length)rows.push(["Tags",r.tags.map(t=>`<span class="chip">${esc(t)}</span>`).join(" ")]);
+  if(r.vulns&&r.vulns.length)rows.push(["Known CVEs",r.vulns.map(v=>`<span class="tag warn">${esc(v)}</span>`).join(" ")]);
+  let html=dl(rows);if(r.note)html+=`<div class="soft" style="margin-top:8px">${esc(r.note)}</div>`;
+  el.innerHTML=html;return}
+ el.innerHTML=`<pre class="term" style="min-height:0">${esc(JSON.stringify(r,null,2))}</pre>`}
 function renderWifi(){const w=S.wifi||{networks:[]},cur=(S.ov?.interfaces||[]).filter(i=>i.wireless);
  if(!cur.length&&!w.networks.length){$("#wifi").innerHTML=`<div class="empty">This computer has no Wi-Fi adapter.</div>`;return}
  let x=cur.map(i=>`<div class="sbody"><dl class="dl" style="margin:0"><dt>${esc(i.name)}</dt><dd>${i.wifi&&i.wifi.ssid?`<b>${esc(i.wifi.ssid)}</b>, ${i.wifi.signal_pct!=null?esc(i.wifi.signal_pct)+"% signal":esc(i.wifi.signal)+" dBm"} (${sigWord(i.wifi.signal)}), ${esc(i.wifi.freq?(/\d$/.test(i.wifi.freq)?i.wifi.freq+" MHz":i.wifi.freq):"")}${i.wifi.channel?", channel "+esc(i.wifi.channel):""}, ${esc(i.wifi.bitrate||"")}`:'<span class="tag warn">Not connected</span>'}</dd></dl></div>`).join("");
@@ -3360,7 +4130,7 @@ document.addEventListener("keydown",e=>{
  if(k==="Escape"){if(!$("#keys").hidden){$("#keys").hidden=true;return}if(!$("#ctx").hidden){closeCtx();return}if(!$("#scrim").hidden){closeDrawer();return}if(typing)e.target.blur();return}
  if((mod&&k.toLowerCase()==="r")||k==="F5"){e.preventDefault();runAll();return}
  if(mod&&k.toLowerCase()==="s"){e.preventDefault();location.href="/api/report.txt";toast("Saving the text report");return}
- if(mod&&/^[1-7]$/.test(k)){e.preventDefault();go(VIEWS[+k-1]);return}
+ if(mod&&/^[1-8]$/.test(k)){e.preventDefault();go(VIEWS[+k-1]);return}
  if(mod&&k.toLowerCase()==="f"||(!typing&&k==="/")){const f=$("#bartools [data-filter]");if(f){e.preventDefault();f.focus();f.select&&f.select()}return}
  if(!typing&&(k==="?"||k==="F1")){e.preventDefault();$("#keys").hidden=!$("#keys").hidden;return}
  if(!$("#ctx").hidden&&(k==="ArrowDown"||k==="ArrowUp")){e.preventDefault();const bs=$$("#ctx button"),i=bs.indexOf(document.activeElement);bs[(i+(k==="ArrowDown"?1:-1)+bs.length)%bs.length].focus();return}
@@ -3383,6 +4153,9 @@ $("#pathf").onsubmit=e=>{e.preventDefault();loadPath()};
 $("#tiface").onchange=e=>{S.tif=e.target.value;drawChart()};
 $("#ctool").onchange=showPresets;$("#crun").onclick=consoleRun;$("#cclear").onclick=()=>{$("#cout").textContent="";delete $("#cout").dataset.used};
 $("#cargs").onkeydown=e=>{if(e.key==="Enter")consoleRun()};
+$("#lldpbtn").onclick=e=>listenLldp(e.currentTarget);
+$$("[data-lk]").forEach(b=>b.onclick=()=>runLookup(b.dataset.lk));
+$("#lktarget").onkeydown=e=>{if(e.key==="Enter")runLookup("dns")};
 window.addEventListener("hashchange",()=>go(location.hash.slice(1)));
 window.addEventListener("resize",()=>{if(S.view==="traffic")drawChart()});
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change",()=>setTheme(document.documentElement.dataset.theme));
