@@ -97,7 +97,7 @@ For TCP, NetPane reads the kernel's own byte counters for each connection (`ss -
 - **Windows:** Windows 10 or 11. The exe has everything built in.
 - **Linux:** Python 3.8 or newer, plus `iproute2` and `iputils-ping`, which almost every distro ships by default.
 
-On Linux, everything else is optional. NetPane uses each tool when it finds it and quietly skips it when it doesn't. The Tools page lists what's missing and gives you the exact install command. On Debian or Ubuntu, this covers the lot:
+On Linux, everything else is optional. NetPane uses each tool when it finds it and skips it when it doesn't. If any are missing, a note at the top of the window tells you which ones and gives you a ready-to-paste install command for your distro (apt, dnf, pacman or zypper). Press **check again** after installing and the note clears itself. You can also click any missing tool on the Tools page to copy the command for just that one. On Debian or Ubuntu, this covers the lot:
 
 ```bash
 sudo apt install -y fping mtr-tiny traceroute dnsutils nmap ethtool arping iw \

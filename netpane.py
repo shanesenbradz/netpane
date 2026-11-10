@@ -46,7 +46,7 @@ try:
 except ImportError:  # optional on Linux, bundled in the Windows exe
     psutil = None
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 IS_WIN = os.name == "nt"
 PLATFORM = "windows" if IS_WIN else "linux"
 
@@ -230,6 +230,29 @@ TOOLS = TOOLS_WIN if IS_WIN else TOOLS_LINUX
 PRESETS = PRESETS_WIN if IS_WIN else PRESETS_LINUX
 
 
+# Debian package names are the default; other families only list what differs.
+PKG_ALT = {
+    "dnf": {"iputils-ping": "iputils", "iputils-tracepath": "iputils", "arping": "iputils", "mtr-tiny": "mtr",
+            "iproute2": "iproute", "network-manager": "NetworkManager", "netcat-openbsd": "nmap-ncat",
+            "dnsutils": "bind-utils", "tshark": "wireshark-cli"},
+    "pacman": {"iputils-ping": "iputils", "iputils-tracepath": "iputils", "mtr-tiny": "mtr",
+               "wireless-tools": "wireless_tools", "network-manager": "networkmanager",
+               "netcat-openbsd": "openbsd-netcat", "dnsutils": "bind", "tshark": "wireshark-cli", "hping3": "hping"},
+    "zypper": {"iputils-ping": "iputils", "iputils-tracepath": "iputils", "arping": "iputils", "mtr-tiny": "mtr",
+               "network-manager": "NetworkManager", "dnsutils": "bind-utils", "tshark": "wireshark"},
+}
+PKG_CMD = {"apt": "sudo apt install -y ", "dnf": "sudo dnf install -y ",
+           "pacman": "sudo pacman -S --needed ", "zypper": "sudo zypper install -y "}
+PKG_NAME = {"apt": "Debian or Ubuntu", "dnf": "Fedora or RHEL", "pacman": "Arch", "zypper": "openSUSE"}
+
+
+def pkg_manager():
+    for pm in ("apt", "dnf", "pacman", "zypper"):
+        if shutil.which(pm if pm != "apt" else "apt-get"):
+            return pm
+    return "apt"
+
+
 def tool_inventory():
     tools = [{"cmd": c, "package": p, "category": cat, "desc": d, "installed": have(c), "path": which(c) or "",
               "presets": PRESETS.get(c, [])} for c, p, cat, d in TOOLS]
@@ -237,15 +260,24 @@ def tool_inventory():
             for n, m in (("scapy", "scapy"), ("psutil", "psutil"))]
     missing = [t for t in tools if not t["installed"]]
     if IS_WIN:
-        cmds = [f"winget install -e --id {WINGET[t['cmd']]}" for t in missing if t["cmd"] in WINGET]
+        for t in tools:
+            t["install"] = f"winget install -e --id {WINGET[t['cmd']]}" if t["cmd"] in WINGET else ""
+        cmds = [t["install"] for t in missing if t["install"]]
         install = "; ".join(cmds)
         hint = "Add the optional extras from PowerShell (the Nmap installer also adds Npcap):"
+        pm = "winget"
     else:
+        pm = pkg_manager()
+        alt = PKG_ALT.get(pm, {})
+        for t in tools:
+            t["package"] = alt.get(t["package"], t["package"])
+            t["install"] = PKG_CMD[pm] + t["package"]
         pkgs = sorted({t["package"] for t in missing})
-        install = ("sudo apt install -y " + " ".join(pkgs)) if pkgs else ""
-        hint = "Install the missing ones on Debian or Ubuntu:"
+        install = (PKG_CMD[pm] + " ".join(pkgs)) if pkgs else ""
+        hint = f"Install the missing ones on {PKG_NAME[pm]}:"
     return {"tools": tools, "libs": libs, "installed": sum(t["installed"] for t in tools),
-            "install_cmd": install, "install_hint": hint, "platform": PLATFORM}
+            "missing": [t["cmd"] for t in missing], "install_cmd": install, "install_hint": hint,
+            "package_manager": pm, "platform": PLATFORM}
 
 
 # --------------------------------------------------------------------------
@@ -3311,7 +3343,20 @@ th.r,td.r{text-align:right}
 td{padding:6px 12px;border-bottom:1px solid var(--line-2);vertical-align:middle}
 tr:last-child td{border-bottom:0}
 tbody tr:hover td{background:var(--hover)}
-tr.click{cursor:default}
+tr.click{cursor:pointer}
+tr.click td{transition:background .12s}
+tr.click td:first-child{box-shadow:inset 2px 0 0 transparent;transition:box-shadow .15s,background .12s}
+tr.click:hover td:first-child{box-shadow:inset 2px 0 0 var(--focus)}
+tr.click td:last-child{position:relative;padding-right:34px}
+tr.click td:last-child::after{content:"";position:absolute;right:12px;top:50%;width:14px;height:14px;margin-top:-7px;background:var(--ink-3);opacity:.45;transition:opacity .15s,transform .15s,background .15s;
+ -webkit-mask:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m9 6 6 6-6 6'/%3E%3C/svg%3E") center/contain no-repeat;
+ mask:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m9 6 6 6-6 6'/%3E%3C/svg%3E") center/contain no-repeat}
+tr.click:hover td:last-child::after,tr.click:focus-visible td:last-child::after,tr.click.sel td:last-child::after{opacity:1;background:var(--focus);transform:translateX(3px)}
+tr.click .devicon{border:1px solid var(--line-2);transition:border-color .15s,color .15s}
+tr.click:hover .devicon{border-color:var(--focus);color:var(--focus)}
+tr.click:hover .devname{color:var(--focus)}
+.clickhint{display:flex;align-items:center;gap:7px;padding:8px 14px;border-top:1px solid var(--line-2);font-size:12px;color:var(--ink-3)}
+.clickhint .i{width:13px;height:13px}
 tr.sel td,tr.sel:hover td{background:var(--select)}
 tr:focus-visible{outline:none}
 tr:focus-visible td{background:var(--select);box-shadow:inset 0 1px 0 var(--focus),inset 0 -1px 0 var(--focus)}
@@ -3347,7 +3392,15 @@ tr:focus-visible td:first-child{box-shadow:inset 2px 0 0 var(--focus),inset 0 1p
 .topo text{fill:var(--ink);font:600 12px var(--sans)}
 .topo text.s{fill:var(--ink-3);font:400 11px var(--mono)}
 .topo text.m{fill:var(--ink-3);font:400 13px var(--sans)}
-.topo g[data-host]:hover .n{fill:var(--hover)}
+.topo g[data-host]{cursor:pointer}
+.topo g[data-host] .n{transition:stroke-width .15s,fill .15s}
+.topo g[data-host] .halo{fill:none;stroke:var(--focus);stroke-width:1.5;stroke-dasharray:3 4;opacity:0;transition:opacity .15s}
+.topo g[data-host]:hover .n{fill:var(--select);stroke-width:3}
+.topo g[data-host]:hover .halo{opacity:.8}
+.topo g[data-host]:hover text:not(.s){fill:var(--focus)}
+.node[data-stage]{cursor:pointer;transition:border-color .2s,color .2s,transform .15s,box-shadow .15s}
+.node[data-stage]:hover{transform:translateY(-2px);box-shadow:0 0 0 4px var(--select)}
+.stage:has(.node[data-stage]:hover) .sname{color:var(--focus)}
 
 /* ---------- traffic ---------- */
 .meters{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));border-top:1px solid var(--line-2)}
@@ -3375,12 +3428,30 @@ canvas{display:block;width:100%}
 .toolgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr))}
 .tool{display:flex;gap:9px;align-items:flex-start;padding:7px 14px}
 .tool .i{width:14px;height:14px;margin-top:2px}
-.tool.on .i{color:var(--ok)}.tool.off{color:var(--ink-3)}.tool.off .i{color:var(--ink-3)}
+.tool.on .i{color:var(--ok)}
+.tool.off{cursor:pointer;border-radius:6px}.tool.off:hover{background:var(--hover);color:var(--ink-2)}
+.tool .get{display:none;font-size:11px;color:var(--focus);margin-top:2px}
+.tool.off:hover .get{display:block}.tool.off:hover div div{display:none}.tool.off{color:var(--ink-3)}.tool.off .i{color:var(--ink-3)}
 .tool b{font-family:var(--mono);font-weight:600;font-size:12.5px}
 .tool div div{font-size:12px;color:var(--ink-3)}
 pre.plain{margin:0;font:11.5px/1.5 var(--mono);white-space:pre-wrap;color:var(--ink-2);user-select:text}
 .copy{display:flex;gap:8px;align-items:center;background:var(--sunken);border:1px solid var(--line);border-radius:6px;padding:6px 8px;margin-top:6px}
 .copy code{flex:1;font:12px var(--mono);overflow-x:auto;white-space:nowrap;user-select:text}
+
+/* ---------- missing tools banner ---------- */
+.toolnote{display:flex;gap:12px;align-items:flex-start;margin:14px 20px 0;padding:12px 14px;border:1px solid var(--line);border-left:3px solid var(--warn);border-radius:8px;background:var(--surface);box-shadow:var(--shadow);animation:tin .25s ease-out}
+.toolnote[hidden]{display:none}
+.toolnote>.i{color:var(--warn);margin-top:2px;width:18px;height:18px}
+.toolnote .tn{flex:1;min-width:0}
+.toolnote b{font-weight:650}
+.toolnote .tlist{margin-top:3px;color:var(--ink-3);font-size:12px}
+.toolnote .tlist span{font-family:var(--mono)}
+.toolnote .copy{margin-top:8px;align-items:flex-start}
+.toolnote .copy code{white-space:normal;overflow-wrap:anywhere;line-height:1.55}
+.toolnote .tact{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
+.nav .badge{margin-left:auto;font-size:10.5px;font-weight:650;min-width:18px;height:16px;padding:0 5px;border-radius:8px;background:var(--warn-soft);color:var(--warn);display:inline-grid;place-items:center}
+.nav .badge:empty{display:none}
+@media (max-width:860px){.toolnote{margin:12px 12px 0}}
 
 /* ---------- overlays ---------- */
 .scrim{position:fixed;inset:0;background:rgba(10,16,22,.32);z-index:40;display:flex;justify-content:flex-end}
@@ -3490,7 +3561,7 @@ pre.plain{margin:0;font:11.5px/1.5 var(--mono);white-space:pre-wrap;color:var(--
    <button data-go="traffic" title="Traffic (Ctrl+5)"><svg class="i"><use href="#i-traffic"/></svg>Traffic</button>
    <button data-go="interfaces" title="Interfaces (Ctrl+6)"><svg class="i"><use href="#i-port"/></svg>Interfaces</button>
    <hr>
-   <button data-go="tools" title="Tools (Ctrl+7)"><svg class="i"><use href="#i-console"/></svg>Tools</button>
+   <button data-go="tools" title="Tools (Ctrl+7)"><svg class="i"><use href="#i-console"/></svg>Tools<span class="badge" id="navtools" title="Tools not installed"></span></button>
    <button data-go="lookups" title="Lookups (Ctrl+8)"><svg class="i"><use href="#i-search"/></svg>Lookups</button>
   </nav>
   <div class="side-foot" id="hostinfo">Connecting…</div>
@@ -3506,6 +3577,7 @@ pre.plain{margin:0;font:11.5px/1.5 var(--mono);white-space:pre-wrap;color:var(--
   </div>
 
   <div class="content" id="content">
+  <div class="toolnote" id="toolnote" role="status" hidden></div>
 
   <!-- DIAGNOSIS -->
   <section class="view" id="v-diagnosis" data-sub="Every layer from this computer out to the web, checked in order.">
@@ -3525,7 +3597,7 @@ pre.plain{margin:0;font:11.5px/1.5 var(--mono);white-space:pre-wrap;color:var(--
     <button class="btn" id="rescan" title="Scan the subnet again"><svg class="i"><use href="#i-refresh"/></svg>Scan</button>
    </div>
    <div class="sheet"><div class="sbody" id="topo"></div></div>
-   <div class="sheet"><div id="neigh"><div class="loading">Scanning the subnet and looking up names</div></div></div>
+   <div class="sheet"><div id="neigh"><div class="loading">Scanning the subnet and looking up names</div></div><div class="clickhint"><svg class="i"><use href="#i-info"/></svg>Click a device to ping it, scan its ports, trace the path or open SSH. Right-click for more.</div></div>
   </section>
 
   <!-- PATH -->
@@ -3847,7 +3919,7 @@ function drawTopo(){const o=S.ov,h=S.health,n=S.neigh;if(!o)return;
  const gw=o.gateway?.gateway,me=(o.interfaces||[]).find(i=>i.name===o.primary);
  const others=(n?.hosts||[]).filter(x=>x.role!=="This host"&&x.role!=="Gateway");
  const per=7,rows=Math.max(1,Math.ceil(others.length/per)),W=1000,busY=150,H=others.length?busY+36+rows*92:busY+80;
- const big=(x,y,icon,label,sub,s,ip)=>`<g${ip?` data-host="${esc(ip)}" data-menu="device" data-ip="${esc(ip)}"`:""}><circle class="n" cx="${x}" cy="${y}" r="28" stroke="${col(s)}"/><svg class="ico" x="${x-12}" y="${y-12}" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><use href="#i-${icon}"/></svg><text x="${x}" y="${y+48}" text-anchor="middle">${esc(label)}</text><text class="s" x="${x}" y="${y+63}" text-anchor="middle">${esc(sub)}</text></g>`;
+ const big=(x,y,icon,label,sub,s,ip)=>`<g${ip?` data-host="${esc(ip)}" data-menu="device" data-ip="${esc(ip)}"`:""}>${ip?`<circle class="halo" cx="${x}" cy="${y}" r="34"/>`:""}<circle class="n" cx="${x}" cy="${y}" r="28" stroke="${col(s)}"/><svg class="ico" x="${x-12}" y="${y-12}" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><use href="#i-${icon}"/></svg><text x="${x}" y="${y+48}" text-anchor="middle">${esc(label)}</text><text class="s" x="${x}" y="${y+63}" text-anchor="middle">${esc(sub)}</text></g>`;
  const wire=(x1,x2,y,s)=>`<line x1="${x1+30}" y1="${y}" x2="${x2-30}" y2="${y}" stroke="${col(s)}" stroke-width="3" stroke-linecap="round"${s==="fail"?' stroke-dasharray="7 6"':""}/>`;
  let g=`<svg class="topo" viewBox="0 0 ${W} ${H}" role="img" aria-label="Network map">`;
  g+=wire(140,500,52,sLan)+wire(500,860,52,sWan);
@@ -3858,7 +3930,7 @@ function drawTopo(){const o=S.ov,h=S.health,n=S.neigh;if(!o)return;
  const step=(W-120)/per;
  others.forEach((x,i)=>{const cx=60+step/2+(i%per)*step,cy=busY+44+Math.floor(i/per)*92;
   if(i<per)g+=`<line class="bus" x1="${cx}" y1="${busY}" x2="${cx}" y2="${cy-20}"/>`;
-  g+=`<g data-host="${esc(x.ip)}" data-menu="device" data-ip="${esc(x.ip)}" data-mac="${esc(x.mac||"")}" data-name="${esc(x.name||"")}"><title>${esc((x.name||"Unnamed")+"  "+x.ip+"  "+(x.vendor||""))}</title><circle class="n" cx="${cx}" cy="${cy}" r="19" stroke="${x.alive?"var(--ok)":"var(--warn)"}"/><svg class="ico" x="${cx-9}" y="${cy-9}" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-${KICON[x.kind]||"unknown"}"/></svg><text x="${cx}" y="${cy+36}" text-anchor="middle" style="font-size:11.5px">${esc(short(x.name||x.vendor||"Unnamed",18))}</text><text class="s" x="${cx}" y="${cy+50}" text-anchor="middle">${esc(x.ip)}</text></g>`});
+  g+=`<g data-host="${esc(x.ip)}" data-menu="device" data-ip="${esc(x.ip)}" data-mac="${esc(x.mac||"")}" data-name="${esc(x.name||"")}"><title>${esc((x.name||"Unnamed")+"  "+x.ip+"  "+(x.vendor||"")+"\nClick for details")}</title><circle class="halo" cx="${cx}" cy="${cy}" r="24"/><circle class="n" cx="${cx}" cy="${cy}" r="19" stroke="${x.alive?"var(--ok)":"var(--warn)"}"/><svg class="ico" x="${cx-9}" y="${cy-9}" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-${KICON[x.kind]||"unknown"}"/></svg><text x="${cx}" y="${cy+36}" text-anchor="middle" style="font-size:11.5px">${esc(short(x.name||x.vendor||"Unnamed",18))}</text><text class="s" x="${cx}" y="${cy+50}" text-anchor="middle">${esc(x.ip)}</text></g>`});
  g+=big(140,52,"computer","This computer",me?.ipv4?.[0]?.split("/")[0]||"",w(st("Physical link"),st("IP address")),null)+big(500,52,"router","Gateway",gw||"none",gw?sGw:"fail",gw)+big(860,52,"globe","Internet",h?.public_ip||"",sWan,null);
  $("#topo").innerHTML=g+"</svg>"}
 
@@ -4061,11 +4133,26 @@ function renderWifi(){const w=S.wifi||{networks:[]},cur=(S.ov?.interfaces||[]).f
  $("#wifi").innerHTML=x}
 
 /* ---------- tools & console ---------- */
-async function loadTools(){try{const t=await api("/api/tools");S.tools=t.tools;renderTools(t);fillConsole()}catch(e){fail("#tools",e)}}
+async function loadTools(){try{const t=await api("/api/tools");S.tools=t.tools;renderTools(t);fillConsole();toolNote(t);return t}catch(e){fail("#tools",e)}}
+function toolNote(t){const miss=t.missing||[],box=$("#toolnote");$("#navtools").textContent=miss.length||"";
+ if(!miss.length){box.hidden=true;try{localStorage.removeItem("np-toolnote")}catch(e){}return}
+ const key=miss.join(",");let off=false;try{off=localStorage.getItem("np-toolnote")===key}catch(e){}
+ const first=!S.toolNoted;S.toolNoted=true;
+ const shown=miss.slice(0,10).map(c=>`<span>${esc(c)}</span>`).join(", ")+(miss.length>10?` and ${miss.length-10} more`:"");
+ box.innerHTML=`${ic("alert")}<div class="tn"><b>${miss.length} of ${t.tools.length} network tools ${miss.length===1?"is":"are"} not installed.</b> NetPane still works, but the checks and pages that rely on ${miss.length===1?"it":"them"} will be limited.
+  <div class="tlist">Missing: ${shown}</div>
+  ${t.install_cmd?`<div class="soft" style="margin-top:8px">${esc(t.install_hint)}</div><div class="copy"><code>${esc(t.install_cmd)}</code><button class="btn sm" data-copy="${esc(t.install_cmd)}" data-copy-label="install command">${ic("copy")}Copy</button></div>`:""}
+  <div class="tact"><button class="btn sm" id="tnrecheck">${ic("refresh")}I've installed them, check again</button><button class="btn sm" data-go="tools">See all tools</button></div></div>
+  <button class="btn icon sm" id="tnclose" title="Hide until something else goes missing" aria-label="Dismiss">${ic("x")}</button>`;
+ box.hidden=off;
+ $("#tnclose").onclick=()=>{box.hidden=true;try{localStorage.setItem("np-toolnote",key)}catch(e){}};
+ $("#tnrecheck").onclick=async e=>{const b=e.currentTarget;b.disabled=true;const r=await loadTools();
+  if(r&&!(r.missing||[]).length)toast("All tools are installed now","ok");else if(r)toast(`${r.missing.length} still missing`,"warn")};
+ if(first&&!off)toast(`${miss.length} network ${miss.length===1?"tool is":"tools are"} not installed. See the note at the top.`,"warn")}
 function renderTools(t){$("#tcount").textContent=`${t.installed} of ${t.tools.length} installed`;
  const cats={};t.tools.forEach(x=>(cats[x.category]=cats[x.category]||[]).push(x));
  let x=t.install_cmd?`<div class="sbody" style="padding-bottom:2px"><div class="soft">${esc(t.install_hint)}</div><div class="copy"><code>${esc(t.install_cmd)}</code><button class="btn sm" data-copy="${esc(t.install_cmd)}" data-copy-label="install command">Copy</button></div></div>`:"";
- x+=Object.entries(cats).map(([c,a])=>`<div class="ghead" style="padding-top:12px">${esc(c)}</div><div class="toolgrid">${a.map(i=>`<div class="tool ${i.installed?"on":"off"}">${ic(i.installed?"check":"x")}<div><b>${esc(i.cmd)}</b><div>${esc(i.desc)}</div></div></div>`).join("")}</div>`).join("");
+ x+=Object.entries(cats).map(([c,a])=>`<div class="ghead" style="padding-top:12px">${esc(c)}</div><div class="toolgrid">${a.map(i=>`<div class="tool ${i.installed?"on":"off"}"${!i.installed&&i.install?` data-copy="${esc(i.install)}" data-copy-label="install command for ${esc(i.cmd)}" title="Click to copy: ${esc(i.install)}"`:""}>${ic(i.installed?"check":"x")}<div><b>${esc(i.cmd)}</b><div>${esc(i.desc)}</div>${!i.installed&&i.install?`<span class="get">Click to copy the install command</span>`:""}</div></div>`).join("")}</div>`).join("");
  $("#tools").innerHTML=x}
 function fillConsole(){const sel=$("#ctool"),cur=sel.value;
  sel.innerHTML=S.tools.map(t=>`<option value="${esc(t.cmd)}"${t.installed?"":" disabled"}>${esc(t.cmd)}${t.installed?"":" (not installed)"}</option>`).join("");
