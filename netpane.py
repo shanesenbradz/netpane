@@ -3372,6 +3372,16 @@ tr:focus-visible td:first-child{box-shadow:inset 2px 0 0 var(--focus),inset 0 1p
 .note{display:flex;gap:9px;padding:9px 12px;border-radius:8px;background:var(--warn-soft);font-size:12.5px;margin:10px 14px}
 .note .i{color:var(--warn);margin-top:1px}
 .note.fail{background:var(--fail-soft)}.note.fail .i{color:var(--fail)}
+.wa-meter{height:8px;border-radius:5px;background:var(--line-2);overflow:hidden;margin:12px 0 6px}
+.wa-meter i{display:block;height:100%;width:0;background:var(--idle);transition:width .25s,background .25s}
+.wa-verdict{font-size:13px;min-height:19px}
+.wa-stats dt{color:var(--ink-3)}
+.wa-hit{display:flex;gap:9px;padding:9px 12px;border-radius:8px;font-size:12.5px;margin-top:12px;align-items:flex-start}
+.wa-hit .i{margin-top:1px;flex:none}
+.wa-hit.bad{background:var(--fail-soft);color:var(--fail)}
+.wa-hit.good{background:var(--ok-soft);color:var(--ok)}
+.wa-batchrow{display:flex;justify-content:space-between;gap:10px;padding:5px 0;border-bottom:1px solid var(--line-2);font-size:12.5px}
+.wa-batchrow .mono{max-width:62%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .note.info{background:var(--sunken)}.note.info .i{color:var(--ink-2)}
 .lossbar{display:flex;align-items:center;gap:8px;min-width:110px}
 .lossbar span{flex:1;height:5px;border-radius:3px;background:var(--line-2);overflow:hidden}
@@ -3544,6 +3554,7 @@ pre.plain{margin:0;font:11.5px/1.5 var(--mono);white-space:pre-wrap;color:var(--
 <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5.5A1.5 1.5 0 0 0 14.5 4h-9A1.5 1.5 0 0 0 4 5.5v9A1.5 1.5 0 0 0 5.5 16H8"/></symbol>
 <symbol id="i-open" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-8 8M18 14v4.5a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 4 18.5v-11A1.5 1.5 0 0 1 5.5 6H10"/></symbol>
 <symbol id="i-keys" viewBox="0 0 24 24"><rect x="2.5" y="6" width="19" height="12" rx="2"/><path d="M6 10h.01M9.5 10h.01M13 10h.01M16.5 10h.01M7 14h10"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l7 2.8v4.9c0 4.3-3 7.5-7 8.8-4-1.3-7-4.5-7-8.8V5.8z"/><path d="m9 11.8 2 2 4-4"/></symbol>
 </defs></svg>
 
 <div class="app">
@@ -3563,6 +3574,7 @@ pre.plain{margin:0;font:11.5px/1.5 var(--mono);white-space:pre-wrap;color:var(--
    <hr>
    <button data-go="tools" title="Tools (Ctrl+7)"><svg class="i"><use href="#i-console"/></svg>Tools<span class="badge" id="navtools" title="Tools not installed"></span></button>
    <button data-go="lookups" title="Lookups (Ctrl+8)"><svg class="i"><use href="#i-search"/></svg>Lookups</button>
+   <button data-go="wifiaudit" title="Wi-Fi Audit (Ctrl+9)"><svg class="i"><use href="#i-shield"/></svg>Wi-Fi Audit</button>
   </nav>
   <div class="side-foot" id="hostinfo">Connecting…</div>
  </aside>
@@ -3663,6 +3675,33 @@ pre.plain{margin:0;font:11.5px/1.5 var(--mono);white-space:pre-wrap;color:var(--
    <div class="sheet" id="lkresult" hidden><div class="shead"><h2 id="lktitle"></h2><span class="hint" id="lksub"></span></div><div class="sbody" id="lkbody"></div></div>
   </section>
 
+  <!-- WI-FI AUDIT -->
+  <section class="view" id="v-wifiaudit" hidden data-sub="Audit a Wi-Fi network you own: encryption on nearby access points, and how a passphrase stands up to a password list.">
+   <div class="sheet"><div class="note info" style="margin:0"><svg class="i"><use href="#i-info"/></svg><div><b>Audit your own network only.</b> This page is read-only and runs entirely in this browser on this computer. Nothing you type and no file you import is sent anywhere. Point it at a network you own and control.</div></div></div>
+
+   <div class="sheet"><div class="shead"><h2>Nearby networks</h2><button class="btn sm" id="wa-rescan"><svg class="i"><use href="#i-refresh"/></svg>Rescan</button></div><div id="wa-aps"><div class="loading">Scanning for Wi-Fi networks</div></div></div>
+
+   <div class="split">
+    <div class="sheet"><div class="shead"><h2>Passphrase strength</h2></div><div class="sbody">
+     <div class="crow"><input class="field" id="wa-pass" type="password" placeholder="Type a passphrase to test (your own Wi-Fi password)" aria-label="Passphrase to test" autocomplete="off" spellcheck="false"><button class="btn icon" id="wa-show" title="Show or hide"><svg class="i"><use href="#i-lock"/></svg></button></div>
+     <div class="wa-meter"><i id="wa-bar"></i></div>
+     <div id="wa-verdict" class="wa-verdict"><span class="muted">Nothing typed yet.</span></div>
+     <div class="crow" style="margin-top:12px"><label class="soft" for="wa-scn" style="align-self:center">Attacker model</label><select class="field" id="wa-scn" style="max-width:340px"><option value="1000000">Wi-Fi WPA2 handshake, GPU rig (~1,000,000 guesses/s)</option><option value="100000">Wi-Fi WPA2 handshake, one GPU (~100,000 guesses/s)</option><option value="100000000000">Leaked fast hash, e.g. MD5 (~100 billion guesses/s)</option></select></div>
+     <dl class="dl wa-stats" id="wa-stats" style="margin:12px 0 0"></dl>
+    </div></div>
+
+    <div class="sheet"><div class="shead"><h2>Password list check</h2></div><div class="sbody">
+     <div class="soft">Import an attacker wordlist, the same kind a brute-force tool feeds on, and NetPane tells you whether a passphrase is in it. If it is, it falls in the first seconds of a dictionary attack.</div>
+     <div class="crow" style="margin-top:12px"><label class="btn" for="wa-file"><svg class="i"><use href="#i-download"/></svg>Import wordlist&hellip;</label><input id="wa-file" type="file" accept=".txt,.lst,.dic,.csv,text/plain" hidden><span class="hint" id="wa-listinfo">No list imported. A built-in list of common passwords is always checked.</span></div>
+     <div id="wa-listhit" class="wa-hit" hidden></div>
+     <div style="margin-top:16px"><div class="soft" style="margin-bottom:6px">Batch test &mdash; paste several passphrases, one per line:</div>
+      <textarea class="field" id="wa-batch" rows="4" placeholder="one passphrase per line" spellcheck="false" style="width:100%;resize:vertical;font-family:var(--mono);font-size:12px"></textarea>
+      <div class="crow" style="margin-top:8px"><button class="btn" id="wa-batchrun"><svg class="i"><use href="#i-play"/></svg>Test these</button><button class="btn" id="wa-batchclear">Clear</button></div>
+      <div id="wa-batchout"></div></div>
+    </div></div>
+   </div>
+  </section>
+
   </div>
 
   <footer class="status" id="status">
@@ -3728,8 +3767,8 @@ document.addEventListener("click",e=>{const th=e.target.closest("[data-tsort]");
  S.sort[id]={k,dir:cur&&cur.k===k&&cur.dir==="asc"?"desc":(cur&&cur.k===k?"asc":(th.classList.contains("r")?"desc":"asc"))};(S.rerender[id]||(()=>{}))()});
 
 /* ---------- navigation, toolbar, title ---------- */
-const VIEWS=["diagnosis","devices","path","apps","traffic","interfaces","tools","lookups"];
-const TITLES={diagnosis:"Diagnosis",devices:"Devices",path:"Path",apps:"Apps",traffic:"Traffic",interfaces:"Interfaces",tools:"Tools",lookups:"Lookups"};
+const VIEWS=["diagnosis","devices","path","apps","traffic","interfaces","tools","lookups","wifiaudit"];
+const TITLES={diagnosis:"Diagnosis",devices:"Devices",path:"Path",apps:"Apps",traffic:"Traffic",interfaces:"Interfaces",tools:"Tools",lookups:"Lookups",wifiaudit:"Wi-Fi Audit"};
 function go(v){if(v==="connections")v="apps";if(!TITLES[v])v="diagnosis";
  const prev=S.view;S.view=v;closeCtx();
  $$(".view").forEach(x=>x.hidden=x.id!=="v-"+v);
@@ -3741,7 +3780,7 @@ function go(v){if(v==="connections")v="apps";if(!TITLES[v])v="diagnosis";
  $("#bartitle").textContent=TITLES[v];$("#barsub").textContent=sec.dataset.sub||"";
  if(location.hash.slice(1)!==v)history.replaceState(null,"","#"+v);
  $("#content").scrollTop=0;
- if(v==="traffic")drawChart();if(v==="tools")showPresets();if(v==="interfaces")loadVlan();if(v==="lookups")$("#lktarget").focus();
+ if(v==="traffic")drawChart();if(v==="tools")showPresets();if(v==="interfaces")loadVlan();if(v==="lookups")$("#lktarget").focus();if(v==="wifiaudit")loadWifiAudit();
  if(v==="apps"||v==="traffic")startApps();else if(prev==="apps"||prev==="traffic")stopApps()}
 function setTheme(t){const r=document.documentElement;if(t)r.dataset.theme=t;else delete r.dataset.theme;
  try{t?localStorage.setItem("np-theme",t):localStorage.removeItem("np-theme")}catch(e){}
@@ -4132,6 +4171,97 @@ function renderWifi(){const w=S.wifi||{networks:[]},cur=(S.ov?.interfaces||[]).f
  else if(w.note)x+=`<div class="note info">${ic("info")}<div>${esc(w.note)}</div></div>`;
  $("#wifi").innerHTML=x}
 
+/* ---------- Wi-Fi security audit (client-side, offline) ---------- */
+const AUDIT={set:new Set(),arr:[],name:""};
+const COMMON=["123456","123456789","12345678","1234567890","password","qwerty","abc123","111111","123123","000000","iloveyou","1234567","qwerty123","admin","welcome","monkey","dragon","letmein","football","password1","12345","qwertyuiop","123321","password123","1q2w3e4r","sunshine","princess","azerty","trustno1","superman","login","starwars","whatever","changeme","passw0rd","zaq12wsx","baseball","master","hello123","freedom","qazwsx","michael","shadow","ashley","access","flower","ninja","hottie","loveme","secret","summer","internet"];
+const COMMONSET=new Set(COMMON);
+function fmtTime(sec){
+ if(!isFinite(sec))return "longer than the universe has existed";
+ if(sec<1)return "under a second";
+ const u=[["second",1],["minute",60],["hour",3600],["day",86400],["year",31557600]];
+ if(sec>=31557600){const yr=sec/31557600;
+  if(yr>=1e12)return Math.round(yr/1e12).toLocaleString()+" trillion years";
+  if(yr>=1e9)return Math.round(yr/1e9).toLocaleString()+" billion years";
+  if(yr>=1e6)return Math.round(yr/1e6).toLocaleString()+" million years";
+  if(yr>=1e3)return Math.round(yr/1e3).toLocaleString()+" thousand years";
+  return Math.round(yr).toLocaleString()+" years"}
+ for(let i=u.length-1;i>=0;i--){const v=sec/u[i][1];if(v>=1){const n=v<10?Math.round(v*10)/10:Math.round(v);return n.toLocaleString()+" "+u[i][0]+(n===1?"":"s")}}
+ return "under a second"}
+function charset(p){let r=0;if(/[a-z]/.test(p))r+=26;if(/[A-Z]/.test(p))r+=26;if(/[0-9]/.test(p))r+=10;if(/[^a-zA-Z0-9\s]/.test(p))r+=33;if(/\s/.test(p))r+=1;return r||1}
+function auditPass(p){
+ const R=charset(p),bits=p.length?p.length*Math.log2(R):0;
+ const rate=+(($("#wa-scn")&&$("#wa-scn").value)||1000000);
+ const sec=(0.5*Math.pow(R,p.length))/rate;
+ const inCommon=COMMONSET.has(p)||COMMONSET.has(p.toLowerCase());
+ const inList=AUDIT.set.has(p);
+ let verdict,cls,pct,why="";
+ if(!p){verdict="Nothing typed yet.";cls="idle";pct=0}
+ else if(inCommon||inList){verdict="Cracked instantly";cls="fail";pct=6;why="this passphrase is in a password list an attacker tries first, so it offers no real protection."}
+ else if(sec<3600){verdict="Very weak";cls="fail";pct=18}
+ else if(sec<2592000){verdict="Weak";cls="fail";pct=38}
+ else if(sec<3155760000){verdict="Fair";cls="warn";pct=62}
+ else if(sec<3.15576e13){verdict="Strong";cls="ok";pct=85}
+ else{verdict="Very strong";cls="ok";pct=100}
+ return {R:R,bits:bits,sec:sec,inCommon:inCommon,inList:inList,verdict:verdict,cls:cls,pct:pct,why:why}}
+function renderPass(){
+ const p=$("#wa-pass").value,a=auditPass(p),bar=$("#wa-bar");
+ bar.style.width=a.pct+"%";
+ bar.style.background=a.cls==="idle"?"var(--idle)":"var(--"+a.cls+")";
+ if(!p){$("#wa-verdict").innerHTML='<span class="muted">Nothing typed yet.</span>';$("#wa-stats").innerHTML="";$("#wa-listhit").hidden=true;return}
+ const vc=a.cls==="idle"?"ink":a.cls;
+ const tail=a.why?" &mdash; "+esc(a.why):" &mdash; about <b>"+esc(fmtTime(a.sec))+"</b> to crack at this attacker’s speed.";
+ $("#wa-verdict").innerHTML='<b style="color:var(--'+vc+')">'+esc(a.verdict)+"</b>"+tail;
+ const g=Math.pow(a.R,p.length);
+ $("#wa-stats").innerHTML='<dt>Length</dt><dd>'+p.length+" characters</dd>"
+  +"<dt>Character pool</dt><dd>"+a.R+" possible symbols</dd>"
+  +"<dt>Entropy</dt><dd>"+Math.round(a.bits)+" bits</dd>"
+  +"<dt>Guesses to exhaust</dt><dd>"+(isFinite(g)?g.toExponential(1).replace("e+"," × 10^"):"more than 10^308")+"</dd>"
+  +"<dt>Time to crack</dt><dd>"+esc(fmtTime(a.sec))+"</dd>";
+ const hit=$("#wa-listhit");hit.hidden=false;
+ if(a.inList||a.inCommon){hit.className="wa-hit bad";
+  const where=a.inList?("your imported list"+(AUDIT.name?" ("+esc(AUDIT.name)+")":"")):"the built-in common-password list";
+  hit.innerHTML=ic("alert")+"<div>Found in "+where+". A dictionary attack reaches this in its first pass, so it is effectively no protection.</div>"}
+ else{hit.className="wa-hit good";
+  hit.innerHTML=ic("check")+"<div>Not in the built-in list"+(AUDIT.set.size?" or your imported list":"")+". That rules out the simplest attacks. Real strength still depends on the numbers above.</div>"}}
+function secClass(sec){const s=String(sec||"").toUpperCase();
+ if(s.includes("WPA3")||s.includes("SAE"))return["ok","WPA3","Current best. Resists offline dictionary attacks."];
+ if(s.includes("WPA2"))return["ok","WPA2","Sound, as long as the passphrase is long and random."];
+ if(s.includes("WPA"))return["warn","WPA (dated)","Older WPA. Move the router to WPA2 or WPA3."];
+ if(s.includes("WEP"))return["fail","WEP — broken","WEP is cracked in minutes. Replace it now."];
+ if(!sec||s==="OPEN"||s==="--"||s==="")return["fail","Open — none","No encryption. Anyone in range can read the traffic."];
+ return["warn",String(sec),""]}
+function renderAuditAps(){
+ const w=S.wifi||{networks:[]},box=$("#wa-aps");
+ if(!w.networks.length){box.innerHTML='<div class="empty">'+esc(w.note||"No Wi-Fi networks in range.")+"</div>";return}
+ S.rerender.waaps=renderAuditAps;
+ box.innerHTML=table([
+  {k:"s",label:"Network",sort:n=>n.ssid,render:n=>(n.inuse?'<span class="tag ok" style="margin-right:8px">You’re on this</span>':"")+esc(n.ssid||"Hidden network")},
+  {k:"c",label:"Ch",r:1,sort:n=>+n.chan||0,render:n=>esc(n.chan)},
+  {k:"g",label:"Signal",r:1,sort:n=>n.signal,render:n=>esc(n.signal)+"%"},
+  {k:"e",label:"Encryption",sort:n=>n.security,render:n=>{const c=secClass(n.security);return '<span class="tag '+c[0]+'">'+esc(c[1])+"</span>"}},
+  {k:"r",label:"What it means",render:n=>{const c=secClass(n.security);return '<span class="soft">'+esc(c[2])+"</span>"}}
+ ],w.networks.slice(0,30),{id:"waaps",sort:{k:"g",dir:"desc"},tall:1})}
+function loadWifiAudit(){if(S.wifi)renderAuditAps();else loadWifi().then(renderAuditAps);renderPass()}
+function runBatch(){const lines=$("#wa-batch").value.split(/\r?\n/).map(s=>s.replace(/\s+$/,"")).filter(Boolean);
+ if(!lines.length){$("#wa-batchout").innerHTML="";return}
+ const rows=lines.slice(0,200).map(p=>{const a=auditPass(p),bad=a.inList||a.inCommon;
+  return '<div class="wa-batchrow"><span class="mono">'+esc(p)+'</span><span class="tag '+(a.cls==="idle"?"warn":a.cls)+'">'+(bad?"In a list":esc(a.verdict))+"</span></div>"}).join("");
+ $("#wa-batchout").innerHTML='<div style="margin-top:8px">'+rows+"</div>"}
+$("#wa-pass")&&($("#wa-pass").oninput=renderPass);
+$("#wa-scn")&&($("#wa-scn").onchange=()=>{renderPass();if($("#wa-batchout")&&$("#wa-batchout").innerHTML)runBatch()});
+$("#wa-show")&&($("#wa-show").onclick=()=>{const i=$("#wa-pass");i.type=i.type==="password"?"text":"password";i.focus()});
+$("#wa-rescan")&&($("#wa-rescan").onclick=()=>{const b=$("#wa-rescan");b.disabled=true;$("#wa-aps").innerHTML='<div class="loading">Scanning for Wi-Fi networks</div>';loadWifi().then(()=>{renderAuditAps();b.disabled=false})});
+$("#wa-file")&&($("#wa-file").onchange=e=>{const f=e.target.files[0];if(!f)return;const info=$("#wa-listinfo");info.textContent="Reading "+f.name+"…";
+ const rd=new FileReader();
+ rd.onload=()=>{const lines=rd.result.split(/\r?\n/),arr=[];for(let i=0;i<lines.length;i++){const v=lines[i].replace(/\s+$/,"");if(v)arr.push(v)}
+  AUDIT.arr=arr;AUDIT.set=new Set(arr);AUDIT.name=f.name;
+  info.textContent="Loaded "+arr.length.toLocaleString()+" passwords from "+f.name+". Checked live as you type.";
+  renderPass();if($("#wa-batchout").innerHTML)runBatch()};
+ rd.onerror=()=>{info.textContent="Could not read that file.";toast("Could not read the wordlist")};
+ rd.readAsText(f)});
+$("#wa-batchrun")&&($("#wa-batchrun").onclick=runBatch);
+$("#wa-batchclear")&&($("#wa-batchclear").onclick=()=>{$("#wa-batch").value="";$("#wa-batchout").innerHTML=""});
+
 /* ---------- tools & console ---------- */
 async function loadTools(){try{const t=await api("/api/tools");S.tools=t.tools;renderTools(t);fillConsole();toolNote(t);return t}catch(e){fail("#tools",e)}}
 function toolNote(t){const miss=t.missing||[],box=$("#toolnote");$("#navtools").textContent=miss.length||"";
@@ -4217,7 +4347,7 @@ document.addEventListener("keydown",e=>{
  if(k==="Escape"){if(!$("#keys").hidden){$("#keys").hidden=true;return}if(!$("#ctx").hidden){closeCtx();return}if(!$("#scrim").hidden){closeDrawer();return}if(typing)e.target.blur();return}
  if((mod&&k.toLowerCase()==="r")||k==="F5"){e.preventDefault();runAll();return}
  if(mod&&k.toLowerCase()==="s"){e.preventDefault();location.href="/api/report.txt";toast("Saving the text report");return}
- if(mod&&/^[1-8]$/.test(k)){e.preventDefault();go(VIEWS[+k-1]);return}
+ if(mod&&/^[1-9]$/.test(k)){e.preventDefault();go(VIEWS[+k-1]);return}
  if(mod&&k.toLowerCase()==="f"||(!typing&&k==="/")){const f=$("#bartools [data-filter]");if(f){e.preventDefault();f.focus();f.select&&f.select()}return}
  if(!typing&&(k==="?"||k==="F1")){e.preventDefault();$("#keys").hidden=!$("#keys").hidden;return}
  if(!$("#ctx").hidden&&(k==="ArrowDown"||k==="ArrowUp")){e.preventDefault();const bs=$$("#ctx button"),i=bs.indexOf(document.activeElement);bs[(i+(k==="ArrowDown"?1:-1)+bs.length)%bs.length].focus();return}
